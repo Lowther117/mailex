@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Frozen entry point for PST Exporter (PyInstaller builds).
+"""Frozen entry point for Mailex (PyInstaller builds).
 
 Handles what a double-clicked, windowed executable has to handle: Finder's
 -psn argument, a missing stdout, and start-up failures that would otherwise
 be silent.
 
-  PST Exporter                   launch the window
-  PST Exporter FILE.pst          launch with a file loaded
-  PST Exporter selftest          run the self-test, write pst-exporter-selftest.txt, exit
-  PST Exporter export ...        command-line export (see --help)
+  Mailex                   launch the window
+  Mailex FILE.pst          launch with a file loaded
+  Mailex selftest          run the self-test, write mailex-selftest.txt, exit
+  Mailex export ...        command-line export (see --help)
 """
 import multiprocessing
 import os
@@ -51,7 +51,7 @@ def _fix_streams():
 
 
 def _crash(exc):
-    path = os.path.join(_app_dir(), "pst-exporter-crash.log")
+    path = os.path.join(_app_dir(), "mailex-crash.log")
     body = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     try:
         with open(path, "a", encoding="utf-8") as fh:
@@ -63,7 +63,7 @@ def _crash(exc):
         from tkinter import messagebox
         root = tk.Tk()
         root.withdraw()
-        messagebox.showerror("PST Exporter could not start",
+        messagebox.showerror("Mailex could not start",
                              f"{type(exc).__name__}: {exc}\n\nDetails written to:\n{path}")
         root.destroy()
     except Exception:
@@ -81,7 +81,7 @@ def main():
     if here not in sys.path:
         sys.path.insert(0, here)
     try:
-        from pstlib.cli import main as cli_main
+        from mailexlib.cli import main as cli_main
         return cli_main(args)
     except SystemExit:
         raise

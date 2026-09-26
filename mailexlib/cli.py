@@ -4,22 +4,28 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from typing import List
+from typing import List, Tuple
 
 from .paths import APP, VERSION, default_save_dir
 
-USAGE = f"""{APP} {VERSION}
+USAGE = f"""{APP} {VERSION} - open any mailbox, export it any way
 
-  pst_exporter                              open the window
-  pst_exporter FILE.pst [FILE.ost ...]      open the window with these files loaded
-  pst_exporter export SOURCE... [options]   export without the window (SOURCE = files or folders)
-  pst_exporter list FILE                    print the folder tree with message counts
-  pst_exporter info FILE                    print what kind of file it is
-  pst_exporter selftest [FILE ...]          build synthetic PSTs, read them, export every format
+  mailex                                  open the window
+  mailex SOURCE...                        open the window with these loaded
+  mailex export SOURCE... [options]       export without the window
+  mailex list SOURCE...                   print the folder tree with message counts
+  mailex info SOURCE...                   print what kind of mailbox it is
+  mailex selftest [FILE ...]              build synthetic mailboxes in every format, read and export them
+
+SOURCE is a file - Outlook .pst / .ost, an .mbox, a single .eml / .emlx / .msg -
+or a folder. A folder is worked out from what is in it: PST/OST files, MBOX
+files (a Thunderbird Mail folder with its .sbd sub-folders, Apple Mail .mbox
+packages), a Maildir (cur/new/tmp), or a tree of loose .eml / .msg / .emlx
+files whose directories become the folders. Everything found is opened.
 
 export options:
   -f, --format FMT      eml (default), mbox, pdf, html, txt, attachments
-  -o, --out DIR         destination (default: <Downloads>/PST export)
+  -o, --out DIR         destination (default: <Downloads>/Mailex export)
   --folder PATH         only this folder (and its subfolders), e.g. "Inbox" or "Inbox/Projects"
   --search TEXT         only messages whose subject, sender or recipients contain TEXT
   --email-only          skip calendar, contact, task and note items
@@ -29,23 +35,30 @@ export options:
 """
 
 
-def _find_sources(sources: List[str]) -> List[str]:
-    out = []
+def _find_sources(sources: List[str]) -> List[Tuple[str, str]]:
+    """(kind, path) for everything openable in the given files and folders."""
+    from .sources import find_sources
+    out: List[Tuple[str, str]] = []
     for s in sources:
         if os.path.isdir(s):
-            for base, _d, files in os.walk(s):
-                for fn in sorted(files):
-                    if fn.lower().endswith((".pst", ".ost")):
-                        out.append(os.path.join(base, fn))
+            found = find_sources(s)
+            if not found:
+                print(f"nothing openable under: {s}", file=sys.stderr)
+            out.extend(found)
         elif os.path.isfile(s):
-            out.append(s)
+            out.append(("file", s))
         else:
             print(f"not found: {s}", file=sys.stderr)
     return out
 
 
+def _open(kind: str, path: str):
+    from .sources import open_found, open_source
+    return open_source(path) if kind == "file" else open_found(kind, path)
+
+
 def cmd_export(argv: List[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pst_exporter export", add_help=True)
+    ap = argparse.ArgumentParser(prog="mailex export", add_help=True)
     ap.add_argument("sources", nargs="+")
     ap.add_argument("-f", "--format", default="eml", choices=["eml", "mbox", "pdf", "html", "txt", "attachments"])
     ap.add_argument("-o", "--out", default="")
@@ -57,18 +70,17 @@ def cmd_export(argv: List[str]) -> int:
     ap.add_argument("--single-pdf", action="store_true")
     a = ap.parse_args(argv)
     from .export import ExportOptions, Exporter
-    from .message import PSTFile
 
     files = _find_sources(a.sources)
     if not files:
         print("nothing to export", file=sys.stderr)
         return 2
-    out = a.out or os.path.join(default_save_dir(), "PST export")
+    out = a.out or os.path.join(default_save_dir(), "Mail export")
     psts = []
     rows = []
-    for f in files:
+    for kind, f in files:
         try:
-            pst = PSTFile(f)
+            pst = _open(kind, f)
         except Exception as exc:  # noqa: BLE001
             print(f"cannot open {f}: {exc}", file=sys.stderr)
             continue
@@ -113,14 +125,13 @@ def cmd_export(argv: List[str]) -> int:
 
 
 def cmd_list(argv: List[str]) -> int:
-    from .message import PSTFile
     if not argv:
-        print("usage: pst_exporter list FILE", file=sys.stderr)
+        print("usage: list FILE_OR_FOLDER", file=sys.stderr)
         return 2
     rc = 0
-    for f in _find_sources(argv):
+    for kind, f in _find_sources(argv):
         try:
-            pst = PSTFile(f)
+            pst = _open(kind, f)
         except Exception as exc:  # noqa: BLE001
             print(f"{f}: {exc}")
             rc = 1
@@ -138,17 +149,16 @@ def cmd_list(argv: List[str]) -> int:
 
 
 def cmd_info(argv: List[str]) -> int:
-    from .message import PSTFile
     if not argv:
-        print("usage: pst_exporter info FILE", file=sys.stderr)
+        print("usage: info FILE_OR_FOLDER", file=sys.stderr)
         return 2
-    for f in _find_sources(argv):
+    for kind, f in _find_sources(argv):
         try:
-            pst = PSTFile(f)
+            pst = _open(kind, f)
         except Exception as exc:  # noqa: BLE001
             print(f"{f}: {exc}")
             continue
-        print(f"{f}\n  {pst.description}\n  store name: {pst.store_name or '(none)'}\n  size: {pst.ndb.size:,} bytes")
+        print(f"{f}\n  {pst.description}\n  store name: {pst.store_name or '(none)'}\n  size: {pst.size:,} bytes")
         for w in pst.warnings:
             print(f"  warning: {w}")
         pst.close()
@@ -171,8 +181,8 @@ def main(argv: List[str]) -> int:
     if argv and argv[0].lower() in ("-v", "--version", "version"):
         print(f"{APP} {VERSION}")
         return 0
-    paths = [a for a in argv if os.path.isfile(a)]
-    unknown = [a for a in argv if not os.path.isfile(a)]
+    paths = [a for a in argv if os.path.exists(a)]
+    unknown = [a for a in argv if not os.path.exists(a)]
     if unknown:
         print(USAGE)
         print(f"unknown argument(s): {' '.join(unknown)}", file=sys.stderr)

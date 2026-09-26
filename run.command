@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run PST Exporter from source on macOS, setting up a virtual environment the
+# Run Mailex from source on macOS, setting up a virtual environment the
 # first time. Use build-app.command if you want a standalone .app instead.
 cd "$(dirname "$0")" || exit 1
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
@@ -24,4 +24,4 @@ if [ ! -x "$VENV/bin/python" ]; then
   "$VENV/bin/python" -m pip install --upgrade pip >/dev/null
   "$VENV/bin/python" -m pip install --only-binary :all: -r requirements.txt || { read -r; exit 1; }
 fi
-exec "$VENV/bin/python" pst_exporter.py "$@"
+exec "$VENV/bin/python" mailex.py "$@"

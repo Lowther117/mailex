@@ -206,9 +206,9 @@ def build_eml(msg: Message, include_attachments: bool = True, depth: int = 0) ->
         put("Message-ID", mid)
     put("In-Reply-To", msg.in_reply_to)
     put("References", msg.references)
-    put("X-PST-Message-Class", msg.message_class)
+    put("X-Mailex-Message-Class", msg.message_class)
     if msg.folder is not None and depth == 0:
-        put("X-PST-Folder", msg.folder.path_str)
+        put("X-Mailex-Folder", msg.folder.path_str)
     if msg.flags & mapi.MSGFLAG_UNSENT:
         put("X-Unsent", "1")
     imp = msg.importance
@@ -221,7 +221,6 @@ def build_eml(msg: Message, include_attachments: bool = True, depth: int = 0) ->
 
     text = msg.body_text
     html = msg.best_html()
-    rtf_bytes = b""
     if not text.strip() and not html.strip():
         rtf_bytes = msg.body_rtf
         if rtf_bytes:
@@ -276,6 +275,12 @@ def build_eml(msg: Message, include_attachments: bool = True, depth: int = 0) ->
 
 
 def eml_bytes(msg: Message, include_attachments: bool = True) -> bytes:
+    """The message as an .eml. Sources that had real RFC 822 bytes (MBOX, EML,
+    Maildir) are passed through untouched; PST and MSG messages are rebuilt."""
+    if include_attachments:
+        raw = msg.raw_eml() if hasattr(msg, "raw_eml") else None
+        if raw:
+            return raw
     return build_eml(msg, include_attachments).as_bytes()
 
 
@@ -495,7 +500,7 @@ class Exporter:
         if self.result.errors or self.result.warnings:
             try:
                 with open(os.path.join(self.o.out_dir, "export-log.txt"), "w", encoding="utf-8") as fh:
-                    fh.write(f"PST Exporter log - {_dt.datetime.now():%Y-%m-%d %H:%M}\n\n")
+                    fh.write(f"Mailex log - {_dt.datetime.now():%Y-%m-%d %H:%M}\n\n")
                     if self.result.errors:
                         fh.write("ERRORS\n" + "\n".join(self.result.errors) + "\n\n")
                     if self.result.warnings:
@@ -559,8 +564,12 @@ class Exporter:
                 self.result.files_written += 1
             # mailbox rewrites "\n" as os.linesep, so hand it LF-only bytes or
             # Windows gets "\r\r\n" on every line
-            em = build_eml(msg, self.o.include_attachments)
-            mb.add(em.as_bytes(policy=em.policy.clone(linesep="\n")))
+            raw = msg.raw_eml() if (self.o.include_attachments and hasattr(msg, "raw_eml")) else None
+            if raw:
+                mb.add(raw.replace(b"\r\n", b"\n"))
+            else:
+                em = build_eml(msg, self.o.include_attachments)
+                mb.add(em.as_bytes(policy=em.policy.clone(linesep="\n")))
         elif fmt == "txt":
             path = unique_path(os.path.join(out_dir, base + ".txt"), self._taken)
             with open(fs_path(path), "w", encoding="utf-8", newline="\n") as fh:

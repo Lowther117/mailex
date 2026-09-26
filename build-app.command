@@ -1,8 +1,8 @@
 #!/bin/bash
 # ---------------------------------------------------------------------------
-#  PST Exporter - macOS build. Double-click this file.
+#  Mailex - macOS build. Double-click this file.
 #  Installs Homebrew and Python if they are missing, installs every
-#  dependency, and produces dist/PSTExporter.app.
+#  dependency, and produces dist/Mailex.app.
 # ---------------------------------------------------------------------------
 cd "$(dirname "$0")" || exit 1
 HERE="$(pwd)"
@@ -16,7 +16,7 @@ export HOMEBREW_NO_AUTO_UPDATE=1
 export HOMEBREW_NO_INSTALL_CLEANUP=1
 
 echo "==============================================="
-echo "  Building PST Exporter for macOS"
+echo "  Building Mailex for macOS"
 echo "  Full log: build-mac-log.txt"
 echo "==============================================="
 echo
@@ -54,9 +54,9 @@ brew_install() {
 # python3 pops up the Xcode command line tools installer.
 pick_python() {
   local c real
-  if [ -n "$PSTEXPORTER_BUILD_PYTHON" ] && [ -x "$PSTEXPORTER_BUILD_PYTHON" ]; then
-    if "$PSTEXPORTER_BUILD_PYTHON" -c 'import tkinter,sys;sys.exit(0 if tkinter.TkVersion>=8.6 else 1)' 2>/dev/null; then
-      echo "$PSTEXPORTER_BUILD_PYTHON"; return 0
+  if [ -n "$MAILEX_BUILD_PYTHON" ] && [ -x "$MAILEX_BUILD_PYTHON" ]; then
+    if "$MAILEX_BUILD_PYTHON" -c 'import tkinter,sys;sys.exit(0 if tkinter.TkVersion>=8.6 else 1)' 2>/dev/null; then
+      echo "$MAILEX_BUILD_PYTHON"; return 0
     fi
   fi
   for c in /opt/homebrew/bin/python3.14 /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.12 \
@@ -101,44 +101,44 @@ echo "[3/7] Installing dependencies (wheels only, no compiling)..."
 "$VPY" -m pip install --only-binary :all: pyinstaller || die "PyInstaller would not install."
 
 echo "[4/7] Checking the code before packaging..."
-"$VPY" -c "import sys; sys.path.insert(0,'.'); import pstlib.ui, pstlib.export, pstlib.pdfout; print('      imports ok')" \
+"$VPY" -c "import sys; sys.path.insert(0,'.'); import mailexlib.ui, mailexlib.export, mailexlib.pdfout; print('      imports ok')" \
   || die "The application does not import cleanly."
 
 echo "[5/7] Packaging (this takes a minute or two)..."
 rm -rf "$HERE/build" "$HERE/dist"
 "$VPY" -m PyInstaller --noconfirm --clean --windowed \
-  --name "PSTExporter" \
-  --osx-bundle-identifier "uk.lowther.pstexporter" \
+  --name "Mailex" \
+  --osx-bundle-identifier "uk.lowther.mailex" \
   --collect-all reportlab \
   --collect-all PIL \
-  --collect-submodules pstlib \
+  --collect-submodules mailexlib \
   --hidden-import tkinter \
   --hidden-import tkinter.ttk \
   --hidden-import tkinter.filedialog \
   --hidden-import tkinter.messagebox \
   --exclude-module pytest \
-  "$HERE/pst_exporter_app.py" || die "PyInstaller failed - see the log above."
-[ -d "$HERE/dist/PSTExporter.app" ] || die "dist/PSTExporter.app was not produced."
+  "$HERE/mailex_app.py" || die "PyInstaller failed - see the log above."
+[ -d "$HERE/dist/Mailex.app" ] || die "dist/Mailex.app was not produced."
 
 echo "[6/7] Clearing quarantine and signing locally..."
 # Without these two an app built on Apple silicon is killed the moment it opens.
-xattr -cr "$HERE/dist/PSTExporter.app" || true
-codesign --force --deep --sign - "$HERE/dist/PSTExporter.app" || die "Ad-hoc signing failed."
+xattr -cr "$HERE/dist/Mailex.app" || true
+codesign --force --deep --sign - "$HERE/dist/Mailex.app" || die "Ad-hoc signing failed."
 
 echo "[7/7] Running the self-test on the built app..."
 echo "      It builds three small PST files, reads them back and exports every"
 echo "      format. About half a minute, and it will look idle while it works."
-rm -f "$HERE/dist/pst-exporter-selftest.txt"
-"$HERE/dist/PSTExporter.app/Contents/MacOS/PSTExporter" selftest || true
+rm -f "$HERE/dist/mailex-selftest.txt"
+"$HERE/dist/Mailex.app/Contents/MacOS/Mailex" selftest || true
 sleep 2
-if [ -f "$HERE/dist/pst-exporter-selftest.txt" ]; then
+if [ -f "$HERE/dist/mailex-selftest.txt" ]; then
   echo
-  cat "$HERE/dist/pst-exporter-selftest.txt"
-  if grep -q "PROBLEMS FOUND" "$HERE/dist/pst-exporter-selftest.txt"; then
+  cat "$HERE/dist/mailex-selftest.txt"
+  if grep -q "PROBLEMS FOUND" "$HERE/dist/mailex-selftest.txt"; then
     echo
     echo "==============================================="
     echo "  BUILT, BUT THE SELF-TEST REPORTED PROBLEMS."
-    echo "  See dist/pst-exporter-selftest.txt above."
+    echo "  See dist/mailex-selftest.txt above."
     echo "==============================================="
     echo
     echo "Press return to close."
@@ -151,7 +151,7 @@ fi
 
 echo
 echo "==============================================="
-echo "  DONE.  dist/PSTExporter.app is ready."
+echo "  DONE.  dist/Mailex.app is ready."
 echo "  Drag it to your Applications folder."
 echo "==============================================="
 echo

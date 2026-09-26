@@ -1,6 +1,6 @@
 @echo off
 setlocal EnableExtensions
-REM Run PST Exporter from source on Windows, setting up a virtual environment
+REM Run Mailex from source on Windows, setting up a virtual environment
 REM the first time. Use build-exe.bat if you want a standalone .exe instead.
 cd /d "%~dp0"
 set "VENV=%~dp0.venv"
@@ -19,7 +19,7 @@ if errorlevel 1 ( echo Could not create the environment. & pause & exit /b 1 )
 if errorlevel 1 ( pause & exit /b 1 )
 
 :run
-start "" "%VENV%\Scripts\pythonw.exe" "%~dp0pst_exporter.py" %*
+start "" "%VENV%\Scripts\pythonw.exe" "%~dp0mailex.py" %*
 exit /b 0
 
 :nopython

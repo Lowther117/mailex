@@ -176,7 +176,7 @@ def _page_footer(canvas, doc):
 def _doc(path: str) -> BaseDocTemplate:
     doc = BaseDocTemplate(path, pagesize=A4, leftMargin=15 * mm, rightMargin=15 * mm,
                           topMargin=15 * mm, bottomMargin=15 * mm, title="Exported message",
-                          author="PST Exporter")
+                          author="Mailex")
     frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="f", leftPadding=0,
                   rightPadding=0, topPadding=0, bottomPadding=0)
     doc.addPageTemplates([PageTemplate(id="p", frames=[frame], onPage=_page_footer)])

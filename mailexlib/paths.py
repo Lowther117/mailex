@@ -5,9 +5,9 @@ import json
 import os
 import sys
 
-APP = "PST Exporter"
-VERSION = "1.0.0"
-SETTINGS_NAME = "pst-exporter-settings.json"
+APP = "Mailex"
+VERSION = "2.0.0"
+SETTINGS_NAME = "mailex-settings.json"
 
 
 def app_dir() -> str:

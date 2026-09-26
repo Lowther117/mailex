@@ -57,6 +57,16 @@ class Recipient:
         if not self.smtp and "@" in self.email and self.addrtype in ("SMTP", ""):
             self.smtp = self.email
 
+    @classmethod
+    def simple(cls, kind: str, name: str, addr: str) -> "Recipient":
+        r = cls.__new__(cls)
+        r.kind = kind if kind in ("To", "Cc", "Bcc") else "To"
+        r.name = (name or "").strip()
+        r.addrtype = "SMTP"
+        r.email = (addr or "").strip()
+        r.smtp = r.email if "@" in r.email else ""
+        return r
+
     @property
     def address(self) -> str:
         """The most useful routable address we have."""
@@ -229,6 +239,10 @@ class MessageRow:
     def pst(self) -> "PSTFile":
         return self.folder.pst
 
+    @property
+    def source(self) -> "PSTFile":
+        return self.folder.pst
+
     def open(self) -> "Message":
         return self.pst.message(self.nid, folder=self.folder, row=self)
 
@@ -251,22 +265,35 @@ class MessageRow:
         return f"MessageRow(0x{self.nid:x}, {self.subject!r})"
 
 
-class Message:
-    """A fully opened message (or an embedded one)."""
+class PropertyMessage:
+    """Everything a message can say about itself from its MAPI property bag.
 
-    def __init__(self, pst: "PSTFile", node: Node, folder: Optional["Folder"] = None,
-                 row: Optional[MessageRow] = None, cpid: Optional[int] = None, embedded: bool = False):
-        self.pst = pst
-        self.node = node
-        self.nid = node.nid
-        self.folder = folder
-        self.row = row
-        self.embedded = embedded
-        self.pc = PropertyContext(node, cpid if cpid is not None else pst.cpid)
-        self.cpid = self.pc.cpid
+    Subclasses supply `self.pc` (get / get_string / ptype / items / __contains__),
+    `self.cpid`, and the recipients() / attachments() lookups; the PST reader
+    and the .msg reader both build on this so exporters see one shape.
+    """
+
+    pst = None
+    source = None
+    folder = None
+    row = None
+    nid = 0
+    embedded = False
+
+    def _init_common(self):
         self._recipients: Optional[List[Recipient]] = None
-        self._attachments: Optional[List[Attachment]] = None
+        self._attachments: Optional[list] = None
         self.warnings: List[str] = []
+
+    def recipients(self) -> List[Recipient]:  # pragma: no cover - overridden
+        return []
+
+    def attachments(self) -> list:  # pragma: no cover - overridden
+        return []
+
+    def raw_eml(self) -> Optional[bytes]:
+        """Original RFC 822 bytes when the source had them; PST/MSG never do."""
+        return None
 
     # -- simple properties --------------------------------------------------
     def get(self, pid, default=None):
@@ -424,6 +451,41 @@ class Message:
         return ""
 
     # -- sub-objects --------------------------------------------------------
+    def recipients_of(self, kind: str) -> List[Recipient]:
+        return [r for r in self.recipients() if r.kind == kind]
+
+    @property
+    def has_attachments(self) -> bool:
+        v = self.get(mapi.PR_HASATTACH)
+        if v is None:
+            return bool(self.flags & mapi.MSGFLAG_HASATTACH) or bool(self.attachments())
+        return bool(v)
+
+    def all_properties(self) -> Iterator[tuple]:
+        """(id, name, type, value) for every property - for the property inspector."""
+        for pid, ptype, val in self.pc.items():
+            yield pid, mapi.tag_name(pid), ptype, val
+
+    def __repr__(self):
+        return f"{type(self).__name__}(0x{self.nid:x}, {self.subject!r})"
+
+
+class Message(PropertyMessage):
+    """A fully opened PST message (or an embedded one)."""
+
+    def __init__(self, pst: "PSTFile", node: Node, folder: Optional["Folder"] = None,
+                 row: Optional[MessageRow] = None, cpid: Optional[int] = None, embedded: bool = False):
+        self.pst = pst
+        self.source = pst
+        self.node = node
+        self.nid = node.nid
+        self.folder = folder
+        self.row = row
+        self.embedded = embedded
+        self.pc = PropertyContext(node, cpid if cpid is not None else pst.cpid)
+        self.cpid = self.pc.cpid
+        self._init_common()
+
     def recipients(self) -> List[Recipient]:
         if self._recipients is None:
             out: List[Recipient] = []
@@ -437,9 +499,6 @@ class Message:
                     self.warnings.append(f"recipient table unreadable: {exc}")
             self._recipients = out
         return self._recipients
-
-    def recipients_of(self, kind: str) -> List[Recipient]:
-        return [r for r in self.recipients() if r.kind == kind]
 
     def attachments(self) -> List[Attachment]:
         if self._attachments is None:
@@ -469,19 +528,12 @@ class Message:
             return bool(self.flags & mapi.MSGFLAG_HASATTACH) or self.node.subnode(NID_ATTACHMENT_TABLE) is not None
         return bool(v)
 
-    def all_properties(self) -> Iterator[tuple]:
-        """(id, name, type, value) for every property — for the property inspector."""
-        for pid, ptype, val in self.pc.items():
-            yield pid, mapi.tag_name(pid), ptype, val
-
-    def __repr__(self):
-        return f"Message(0x{self.nid:x}, {self.subject!r})"
-
 
 class Folder:
     def __init__(self, pst: "PSTFile", nid: int, name: str = "", parent: Optional["Folder"] = None,
                  row: Optional[Dict[int, Any]] = None):
         self.pst = pst
+        self.source = pst
         self.nid = nid
         self.parent = parent
         self.row = row or {}
@@ -603,6 +655,8 @@ class Folder:
 class PSTFile:
     """A PST or OST file opened for reading."""
 
+    kind = "pst"
+
     def __init__(self, path: str):
         self.path = path
         self.ndb = NDB(path)
@@ -631,6 +685,23 @@ class PSTFile:
     @property
     def description(self) -> str:
         return self.ndb.description
+
+    @property
+    def kind_label(self) -> str:
+        return "OST" if self.ndb.is_ost else "PST"
+
+    @property
+    def is_ost(self) -> bool:
+        return self.ndb.is_ost
+
+    @property
+    def sender_from_message(self) -> bool:
+        # OST contents tables carry a stale sender column; the message itself is right
+        return self.ndb.is_ost
+
+    @property
+    def size(self) -> int:
+        return self.ndb.size
 
     def close(self):
         self.ndb.close()

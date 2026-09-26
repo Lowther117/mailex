@@ -9,9 +9,9 @@ dist/
 # build and run output
 build-win-log.txt
 build-mac-log.txt
-pst-exporter-selftest.txt
-pst-exporter-crash.log
-pst-exporter-settings.json
+mailex-selftest.txt
+mailex-crash.log
+mailex-settings.json
 
 # python
 __pycache__/

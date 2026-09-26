@@ -1,9 +1,9 @@
 """Self-test: builds synthetic PST files, reads them back, exports every format.
 
-    python pst_exporter.py selftest            synthetic files only
-    python pst_exporter.py selftest FILE.pst   also open a real file and export it
+    python mailex.py selftest            synthetic files only
+    python mailex.py selftest FILE.pst   also open a real file and export it
 
-Writes <app folder>/pst-exporter-selftest.txt and returns 0 when everything
+Writes <app folder>/mailex-selftest.txt and returns 0 when everything
 passed. A build script treats "PROBLEMS FOUND" in that file as a failure.
 """
 from __future__ import annotations
@@ -24,7 +24,7 @@ from .message import PSTFile
 from .ndb import CRYPT_CYCLIC, CRYPT_NONE, CRYPT_PERMUTE, decrypt_cyclic, decrypt_permute
 from .paths import APP, VERSION, app_dir
 
-REPORT_NAME = "pst-exporter-selftest.txt"
+REPORT_NAME = "mailex-selftest.txt"
 
 _LONG_BODY = ("Paragraph %d of a deliberately long body, long enough to spill out of the heap into a sub-node "
               "and across more than one 8 KB data block, so the XBLOCK path gets exercised too.\n")
@@ -104,7 +104,7 @@ def run(verbose: bool = True, extra_files: Optional[List[str]] = None) -> int:
 
     if verbose:
         print(f"{APP} {VERSION} self-test\n")
-    tmp = tempfile.mkdtemp(prefix="pst-exporter-selftest-")
+    tmp = tempfile.mkdtemp(prefix="mailex-selftest-")
     try:
         # ---- ciphers are exact inverses
         data = bytes(range(256)) * 3
@@ -130,6 +130,14 @@ def run(verbose: bool = True, extra_files: Optional[List[str]] = None) -> int:
                 record(f"synthetic PST ({label})", False, f"{type(exc).__name__}: {exc}")
                 if verbose:
                     traceback.print_exc()
+
+        # ---- the other mailbox formats, built from the synthetic PST's own exports
+        try:
+            _check_sources(record, tmp, mailbox)
+        except Exception as exc:  # noqa: BLE001
+            record("other mailbox formats", False, f"{type(exc).__name__}: {exc}")
+            if verbose:
+                traceback.print_exc()
 
         # ---- optional real files
         for f in extra_files or []:
@@ -320,3 +328,239 @@ def _check_real(path: str, record, tmp: str):
         record(f"real file {os.path.basename(path)}: EML export", res.exported == len(rows) and not res.errors, res.summary())
     finally:
         pst.close()
+
+
+def _check_sources(record, tmp: str, mailbox_def):
+    import shutil
+    from .sources import (FilesSource, MailDirSource, MaildirSource, MboxSource, SingleFileSource, find_sources,
+                          open_found, open_source)
+    base = os.path.join(tmp, "sources")
+    pst_path = os.path.join(base, "seed.pst")
+    os.makedirs(base, exist_ok=True)
+    synth.write_pst(pst_path, mailbox_def)
+    pst = PSTFile(pst_path)
+    seed_rows = list(pst.all_message_rows())
+    n_all = len(seed_rows)
+    inbox_msgs = {r.subject: r.open() for r in seed_rows if r.folder.name == "Inbox"}
+
+    # -- EML tree -> FilesSource
+    eml_dir = os.path.join(base, "eml")
+    export(seed_rows, ExportOptions(fmt="eml", out_dir=eml_dir, write_index=False))
+    src = FilesSource(eml_dir)
+    folders = {f.name: f for f in src.root.walk()}
+    rows = list(src.all_message_rows())
+    uni = [r for r in rows if r.subject == UNICODE_SUBJECT]
+    ok = len(rows) == n_all and "Inbox" in folders and "Bulk" in folders and len(folders["Bulk"].messages()) == 230 and bool(uni)
+    detail = f"{len(rows)} messages, folders {sorted(folders)}"
+    if uni:
+        m = uni[0].open()
+        atts = m.attachments()
+        ok = ok and "<b>HTML</b>" in m.best_html() and len(atts) == 1 and atts[0].data.startswith(b"\x89PNG") \
+            and atts[0].hidden and m.importance == 2 and len(m.recipients_of("Cc")) == 1 and m.raw_eml() is not None
+    fw = [r for r in rows if r.subject.startswith("FW: with an embedded")]
+    if fw:
+        m = fw[0].open()
+        emb = [a for a in m.attachments() if a.is_embedded_message]
+        ok = ok and bool(emb) and emb[0].embedded_message is not None and emb[0].embedded_message.subject == "Forwarded original"
+    record("EML folder source", ok, detail)
+    # passthrough: exporting the EML source again gives identical bytes
+    out2 = os.path.join(base, "eml-again")
+    export(rows, ExportOptions(fmt="eml", out_dir=out2, write_index=False, per_file_subfolder=False))
+    a = sorted(glob.glob(os.path.join(eml_dir, "**", "*.eml"), recursive=True))
+    b = sorted(glob.glob(os.path.join(out2, "**", "*.eml"), recursive=True))
+    same = len(a) == len(b) and all(open(x, "rb").read() == open(y, "rb").read() for x, y in zip(a, b))
+    record("EML passthrough is byte-identical", same, f"{len(a)} vs {len(b)} files")
+
+    # -- .emlx
+    emlx_dir = os.path.join(base, "emlx")
+    os.makedirs(emlx_dir)
+    raw = open(a[0], "rb").read()
+    with open(os.path.join(emlx_dir, "1.emlx"), "wb") as fh:
+        fh.write(str(len(raw)).encode() + b"\n" + raw + b"<?xml version=\"1.0\"?><plist/>")
+    src = SingleFileSource(os.path.join(emlx_dir, "1.emlx"))
+    m = list(src.all_message_rows())[0].open()
+    record("EMLX single file", m.raw_eml() == raw and bool(m.subject), m.subject[:40])
+
+    # -- MBOX file, mail folder (Thunderbird layout), Apple package
+    mbox_dir = os.path.join(base, "mbox")
+    export(seed_rows, ExportOptions(fmt="mbox", out_dir=mbox_dir, write_index=False, per_file_subfolder=False))
+    mboxes = sorted(glob.glob(os.path.join(mbox_dir, "**", "*.mbox"), recursive=True))
+    bulk = [x for x in mboxes if os.path.basename(x) == "Bulk.mbox"][0]
+    src = MboxSource(bulk)
+    rows = list(src.all_message_rows())
+    m = rows[5].open()
+    record("MBOX file source", len(rows) == 230 and m.subject.startswith("Bulk message") and m.raw_eml() is not None
+           and m.read, f"{len(rows)} messages in {os.path.basename(bulk)}")
+    src.close()
+    tb = os.path.join(base, "thunderbird", "Mail", "Local Folders")
+    os.makedirs(os.path.join(tb, "Archive.sbd"))
+    inbox_mbox = [x for x in mboxes if os.path.basename(x) == "Inbox.mbox"][0]
+    shutil.copy(inbox_mbox, os.path.join(tb, "Inbox"))
+    shutil.copy(bulk, os.path.join(tb, "Archive"))
+    shutil.copy([x for x in mboxes if os.path.basename(x) == "Sent Items.mbox"][0], os.path.join(tb, "Archive.sbd", "2024"))
+    with open(os.path.join(tb, "Inbox.msf"), "w") as fh:
+        fh.write("// <!-- <mdb:mork:z v=\"1.4\"/> -->")
+    src = MailDirSource(tb)
+    folders = {f.path_str: len(f.messages()) for f in src.root.walk()}
+    record("Thunderbird mail folder source", folders.get("Local Folders/Inbox") == 8 and folders.get("Local Folders/Archive") == 230
+           and folders.get("Local Folders/Archive/2024") == 1 and not any(".msf" in k for k in folders), str(folders))
+    src.close()
+    apple = os.path.join(base, "Apple.mbox")
+    os.makedirs(apple)
+    shutil.copy(inbox_mbox, os.path.join(apple, "mbox"))
+    src = open_source(apple)
+    record("Apple Mail .mbox package", len(list(src.all_message_rows())) == 8 and src.name == "Apple.mbox", src.description)
+    src.close()
+
+    # -- Maildir with a Courier-style sub-folder and read/unread flags
+    md = os.path.join(base, "Maildir")
+    for sub in ("cur", "new", "tmp", ".Projects/cur", ".Projects/new", ".Projects/tmp"):
+        os.makedirs(os.path.join(md, sub))
+    for i, x in enumerate(a[:6]):
+        shutil.copy(x, os.path.join(md, "cur" if i % 2 == 0 else "new", f"{i}.mail" + (":2,S" if i % 2 == 0 else "")))
+    for i, x in enumerate(a[6:9]):
+        shutil.copy(x, os.path.join(md, ".Projects", "cur", f"{i}.mail:2,"))
+    src = MaildirSource(md)
+    root_rows = src.root.messages()
+    proj = [f for f in src.root.walk() if f.name == "Projects"]
+    ok = len(root_rows) == 6 and sum(1 for r in root_rows if r.read) == 3 and proj and len(proj[0].messages()) == 3 \
+        and not proj[0].messages()[0].read
+    record("Maildir source", ok, f"{len(root_rows)} + {len(proj[0].messages()) if proj else 0} messages")
+
+    # -- .msg files through the compound-file writer and reader
+    msg_dir = os.path.join(base, "msg")
+    os.makedirs(msg_dir)
+    for i, m in enumerate(mailbox_def[0].subfolders[0].messages):
+        synth.write_msg(os.path.join(msg_dir, f"{i}.msg"), m)
+    src = FilesSource(msg_dir)
+    rows = list(src.all_message_rows())
+    got = {r.subject: r.open() for r in rows}
+    ok = len(rows) == 8
+    m = got.get(UNICODE_SUBJECT)
+    ok = ok and m is not None and "<b>HTML</b>" in m.best_html() and m.attachments()[0].data.startswith(b"\x89PNG") \
+        and m.attachments()[0].hidden and len(m.recipients()) == 3 and m.sender_email == "zoe@example.com"
+    m = got.get("Long body and a big attachment")
+    ok = ok and m is not None and m.body_text == LONG_BODY and len(m.attachments()[0].data) == 50_000
+    m = got.get("RTF only body")
+    ok = ok and m is not None and "Hello from RTF with café" in m.best_text()
+    m = got.get("FW: with an embedded message")
+    emb = m.attachments()[0].embedded_message if m and m.attachments() else None
+    ok = ok and emb is not None and emb.subject == "Forwarded original" and emb.body_text == "This is the embedded message body."
+    record("Outlook .msg files (compound file reader)", ok, f"{len(rows)} files")
+
+    # -- the layouts real machines have
+    live = os.path.join(base, "applelive", "Inbox.mbox", "0A1B2C3D-0000-4000-8000-000000000001", "Data", "1", "Messages")
+    os.makedirs(live)
+    for i, x in enumerate(a[:3]):
+        raw2 = open(x, "rb").read()
+        with open(os.path.join(live, f"{i + 1}.emlx"), "wb") as fh:
+            fh.write(str(len(raw2)).encode() + b"\n" + raw2 + b"<plist/>")
+    child = os.path.join(base, "applelive", "Inbox.mbox", "Receipts.mbox", "0A1B2C3D-0000-4000-8000-000000000002", "Data", "Messages")
+    os.makedirs(child)
+    raw2 = open(a[3], "rb").read()
+    with open(os.path.join(child, "9.emlx"), "wb") as fh:
+        fh.write(str(len(raw2)).encode() + b"\n" + raw2 + b"<plist/>")
+    src = open_source(os.path.join(base, "applelive", "Inbox.mbox"))
+    counts = {f.path_str: len(f.messages()) for f in src.root.walk()}
+    record("Apple Mail live mailbox (V2+ layout, nested child)", counts == {"Inbox": 3, "Inbox/Receipts": 1}, str(counts))
+    found = find_sources(os.path.join(base, "applelive"))
+    record("Apple Mail live mailbox found from its parent", found == [("mbox", os.path.join(base, "applelive", "Inbox.mbox"))], str(found))
+
+    tb2 = os.path.join(base, "tb-empty", "Local Folders")
+    os.makedirs(os.path.join(tb2, "Archives.sbd"))
+    open(os.path.join(tb2, "Archives"), "wb").close()                       # 0-byte placeholder
+    shutil.copy(bulk, os.path.join(tb2, "Archives.sbd", "2019"))
+    found = find_sources(os.path.join(base, "tb-empty"))
+    ok = found == [("mboxdir", tb2)]
+    if ok:
+        src = MailDirSource(tb2)
+        counts = {f.path_str: len(f.messages()) for f in src.root.walk()}
+        ok = counts.get("Local Folders/Archives/2019") == 230 and counts.get("Local Folders/Archives") == 0
+    record("Thunderbird folder whose own mbox is empty", ok, str(found))
+
+    # a Maildir copied through Windows uses '!' instead of ':' in the flags
+    md2 = os.path.join(base, "Maildir-win")
+    for sub in ("cur", "new", "tmp"):
+        os.makedirs(os.path.join(md2, sub))
+    shutil.copy(a[0], os.path.join(md2, "cur", "1.mail!2,S"))
+    shutil.copy(a[1], os.path.join(md2, "cur", "2.mail!2,"))
+    shutil.copy(a[2], os.path.join(md2, "cur", "3.mail!2,ST"))
+    rows2 = MaildirSource(md2).root.messages()
+    record("Maildir flags with '!' separator, trashed skipped", len(rows2) == 2 and rows2[0].read and not rows2[1].read,
+           f"{len(rows2)} rows")
+
+    # mbox read from several threads at once must never mix messages up
+    import threading
+    src = MboxSource(bulk)
+    rows2 = list(src.all_message_rows())
+    bad = []
+
+    def hammer(offset):
+        for i in range(offset, len(rows2), 7):
+            m = rows2[i].open()
+            if m.subject != rows2[i].subject:
+                bad.append(i)
+    ts = [threading.Thread(target=hammer, args=(k,)) for k in range(4)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    record("MBOX reads from four threads stay consistent", not bad, f"{len(bad)} mismatches")
+
+    # odd MIME: unknown charset, calendar part, split body
+    odd = (b"From: a@example.com\r\nTo: b@example.com\r\nSubject: odd\r\nDate: Tue, 05 Mar 2024 09:30:15 +0000\r\n"
+           b"MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"B\"\r\n\r\n"
+           b"--B\r\nContent-Type: text/plain; charset=x-user-defined\r\n\r\nfirst part\r\n"
+           b"--B\r\nContent-Type: image/png\r\nContent-Disposition: inline\r\n\r\nPNG\r\n"
+           b"--B\r\nContent-Type: text/plain; charset=\"iso-8859-8-i\"\r\n\r\nsecond part\r\n"
+           b"--B\r\nContent-Type: text/calendar; method=REQUEST\r\n\r\nBEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n--B--\r\n")
+    from .sources import MimeMessage
+    mm = MimeMessage(src, odd)
+    atts = mm.attachments()
+    record("odd MIME: unknown charsets, split body, calendar part", mm.body_text == "first part\n\nsecond part"
+           and [x.mime_type for x in atts] == ["image/png", "text/calendar"], f"{mm.body_text!r} {atts}")
+
+    # a corrupted .msg must fail quickly and cleanly, not hang
+    import random
+    import time as _time
+    raw_msg = open(os.path.join(msg_dir, "1.msg"), "rb").read()
+    random.seed(7)
+    worst = 0.0
+    for _ in range(40):
+        b = bytearray(raw_msg)
+        for _j in range(random.randint(1, 30)):
+            b[random.randrange(min(len(b), 4096))] = random.randrange(256)
+        t0 = _time.time()
+        try:
+            from .cfb import CompoundFile
+            from .msgfile import MsgMessage
+            mm = MsgMessage(src, None, cf=CompoundFile(bytes(b)))
+            mm.subject
+            mm.best_text()
+            [(x.filename, x.data) for x in mm.attachments()]
+        except Exception:  # noqa: BLE001
+            pass
+        worst = max(worst, _time.time() - t0)
+    record("corrupt .msg files fail fast", worst < 2.0, f"worst {worst:.2f}s")
+
+    # -- find_sources over the lot, then one bulk export of everything
+    found = find_sources(base)
+    kinds = sorted(k for k, _p in found)
+    ok = kinds == ["files", "maildir", "maildir", "mbox", "mbox", "mboxdir", "mboxdir", "mboxdir", "pst"]
+    record("find_sources on a mixed folder", ok, str(kinds))
+    srcs_all = [open_found(k, p) for k, p in found]
+    ids = [(r.pst.path, r.folder.path_str, r.subject) for s_ in srcs_all for r in s_.all_message_rows()]
+    record("nothing is listed twice", len(ids) == len(set(ids)), f"{len(ids)} rows, {len(set(ids))} distinct")
+    for s_ in srcs_all:
+        s_.close()
+    srcs = [open_found(k, p) for k, p in found]
+    rows = [r for s_ in srcs for r in s_.all_message_rows()]
+    total = len(rows)
+    out = os.path.join(base, "everything")
+    for fmt in ("eml", "html"):
+        res = export(rows, ExportOptions(fmt=fmt, out_dir=os.path.join(out, fmt), include_attachments=(fmt == "eml")))
+        record(f"bulk export of every source kind ({fmt})", res.exported == total and not res.errors,
+               res.summary() + f" from {len(srcs)} sources" + ("; " + res.errors[0] if res.errors else ""))
+    for s_ in srcs:
+        s_.close()
+    pst.close()

@@ -24,8 +24,8 @@ function Test-RealPython([string]$exe) {
 }
 
 function Find-Python {
-  if ($env:PSTEXPORTER_BUILD_PYTHON -and (Test-RealPython $env:PSTEXPORTER_BUILD_PYTHON)) {
-    return $env:PSTEXPORTER_BUILD_PYTHON
+  if ($env:MAILEX_BUILD_PYTHON -and (Test-RealPython $env:MAILEX_BUILD_PYTHON)) {
+    return $env:MAILEX_BUILD_PYTHON
   }
   # py launcher first: it knows about every installed version
   $py = (Get-Command py -ErrorAction SilentlyContinue)

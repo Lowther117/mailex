@@ -1,4 +1,4 @@
-"""The PST Exporter window."""
+"""The Mailex window."""
 from __future__ import annotations
 
 import os
@@ -15,11 +15,8 @@ from tkinter import filedialog, messagebox, ttk
 from . import theme
 from .export import FORMATS, ExportOptions, ExportResult, Exporter, eml_bytes, human_size, local, sanitize
 from .message import Folder, Message, MessageRow, PSTFile
-from .ndb import PSTError
 from .paths import APP, VERSION, default_save_dir, downloads_dir, load_settings, save_settings
-
-PST_TYPES = [("Outlook data files", "*.pst *.ost *.PST *.OST"), ("PST files", "*.pst"),
-             ("OST files", "*.ost"), ("All files", "*.*")]
+from .sources import FILE_TYPES, MailSource, find_sources, open_found, open_source
 
 _HIDE_FOLDERS = {"IPM_SUBTREE"}  # shown flattened - their children matter, they do not
 
@@ -34,9 +31,9 @@ class App(ttk.Frame):
         self.ui = theme.ui_family(root)
         self.mono = theme.mono_family(root)
         self.q: "queue.Queue" = queue.Queue()
-        self.files: List[PSTFile] = []
+        self.files: List[MailSource] = []
         self.folder_of_item: Dict[str, Folder] = {}
-        self.file_of_item: Dict[str, PSTFile] = {}
+        self.file_of_item: Dict[str, MailSource] = {}
         self.rows_of_item: Dict[str, MessageRow] = {}
         self.current_rows: List[MessageRow] = []
         self.current_folder: Optional[Folder] = None
@@ -58,7 +55,7 @@ class App(ttk.Frame):
         self._exporting = False
         self._iid_of_row: Dict[int, str] = {}
 
-        root.title(f"{APP} - read and export Outlook PST / OST files without Outlook")
+        root.title(f"{APP} - open any mailbox, export it any way")
         root.geometry(self.settings.get("geometry") or self._default_geometry(root))
         root.minsize(980, 620)
         self.pack(fill="both", expand=True)
@@ -125,8 +122,8 @@ class App(ttk.Frame):
     def _build_menu(self):
         m = tk.Menu(self.root, tearoff=0)
         f = tk.Menu(m, tearoff=0)
-        f.add_command(label="Open PST / OST files…", accelerator="Ctrl+O", command=self.open_files)
-        f.add_command(label="Open a folder of PST / OST files…", command=self.open_folder)
+        f.add_command(label="Open mailbox files…", accelerator="Ctrl+O", command=self.open_files)
+        f.add_command(label="Open a folder (PSTs, MBOX files, Maildir, EML / MSG files…)…", command=self.open_folder)
         f.add_command(label="Close selected file", command=self.close_selected_file)
         f.add_command(label="Close all", command=self.close_all)
         f.add_separator()
@@ -388,51 +385,69 @@ class App(ttk.Frame):
 
     # ----------------------------------------------------------- opening
     def open_files(self):
-        paths = filedialog.askopenfilenames(title="Open PST / OST files", filetypes=PST_TYPES,
+        paths = filedialog.askopenfilenames(title="Open mailbox files", filetypes=FILE_TYPES,
                                             initialdir=self.settings.get("last_open_dir") or downloads_dir())
         if paths:
             self.settings["last_open_dir"] = os.path.dirname(paths[0])
             self.open_paths(list(paths))
 
     def open_folder(self):
-        d = filedialog.askdirectory(title="Open every PST / OST file in a folder (and its subfolders)",
+        d = filedialog.askdirectory(title="Open a folder: PST / OST / MBOX files, a Maildir, or EML / MSG files",
                                     initialdir=self.settings.get("last_open_dir") or downloads_dir())
         if not d:
             return
         self.settings["last_open_dir"] = d
 
         def work():
-            found = []
-            for base, _dirs, files in os.walk(d):
-                for fn in files:
-                    if fn.lower().endswith((".pst", ".ost")):
-                        found.append(os.path.join(base, fn))
-            return sorted(found)
+            return find_sources(d)
 
         def done(res):
             if isinstance(res, BaseException):
                 messagebox.showerror(APP, f"Could not search that folder:\n{res}")
                 return
             if not res:
-                messagebox.showinfo(APP, "No .pst or .ost files were found in that folder.")
+                messagebox.showinfo(APP, "Nothing openable was found in that folder: no PST / OST / MBOX files, "
+                                         "no Maildir, and no .eml / .msg / .emlx files.")
                 return
-            self.open_paths(res)
+            self.open_paths([p for _k, p in res], kinds=[k for k, _p in res])
 
-        self._run_bg(work, done, f"Looking for PST / OST files under {d}…")
+        self._run_bg(work, done, f"Looking for mailboxes under {d}…")
 
-    def open_paths(self, paths: List[str]):
+    def open_paths(self, paths: List[str], kinds: Optional[List[str]] = None):
         already = {os.path.normcase(os.path.abspath(f.path)) for f in self.files}
-        todo = [p for p in paths if os.path.normcase(os.path.abspath(p)) not in already]
+        todo = [(p, (kinds[i] if kinds else None)) for i, p in enumerate(paths)
+                if os.path.normcase(os.path.abspath(p)) not in already]
         if not todo:
             self.status_msg("Those files are already open.")
             return
 
         def work():
             out = []
-            for p in todo:
+            for p, kind in todo:
                 try:
-                    pst = PSTFile(p)
-                    # pre-walk the folder tree so the UI can build it without touching the file
+                    if kind:
+                        pst = open_found(kind, p)
+                    elif os.path.isdir(p):
+                        found = find_sources(p)
+                        if len(found) == 1:
+                            pst = open_found(*found[0])
+                        elif not found:
+                            raise ValueError("nothing openable in that folder")
+                        else:
+                            # several things inside: open each of them
+                            for k2, p2 in found:
+                                try:
+                                    src = open_found(k2, p2)
+                                    _count_folders(src)
+                                    out.append((p2, src, list(src.root.walk()), None))
+                                except Exception as exc:  # noqa: BLE001
+                                    out.append((p2, None, [], exc))
+                            continue
+                    else:
+                        pst = open_source(p)
+                    # pre-walk the folder tree (and count messages for the non-PST sources)
+                    # so the UI can build it without touching the file
+                    _count_folders(pst)
                     folders = list(pst.root.walk())
                     out.append((p, pst, folders, None))
                 except Exception as exc:  # noqa: BLE001
@@ -471,16 +486,16 @@ class App(ttk.Frame):
                 if folder.name.lower() == "inbox" and folder.content_count:
                     target = iid
                     break
-                if fallback is None and folder.content_count and (folder.nid & 0x1F) == 0x02:
+                if fallback is None and folder.content_count and (not isinstance(new_file, PSTFile) or (folder.nid & 0x1F) == 0x02):
                     fallback = iid
             target = target or fallback or first_item
             self.tree.selection_set(target)
             self.tree.see(target)
 
-    def _add_file_to_tree(self, pst: PSTFile) -> str:
+    def _add_file_to_tree(self, pst: MailSource) -> str:
         fid = self._next_fid
         self._next_fid += 1
-        label = f"{pst.name}   ({pst.ndb.description.split(',')[0]})"
+        label = f"{pst.name}   ({pst.kind_label})"
         root_iid = f"f{fid}"
         self.tree.insert("", "end", iid=root_iid, text=label, open=True)
         self.file_of_item[root_iid] = pst
@@ -494,7 +509,7 @@ class App(ttk.Frame):
                 iid = f"f{fid}n{sf.nid:x}"
                 n = sf.content_count
                 text = f"{sf.name}  ({n})" if n else sf.name
-                if (sf.nid & 0x1F) == 0x03:
+                if isinstance(pst, PSTFile) and (sf.nid & 0x1F) == 0x03:
                     text += "  [search folder]"
                 self.tree.insert(parent_iid, "end", iid=iid, text=text, open=sf.name in ("Root - Mailbox",))
                 self.file_of_item[iid] = pst
@@ -515,7 +530,7 @@ class App(ttk.Frame):
             return
         self._close_file(pst)
 
-    def _close_file(self, pst: PSTFile):
+    def _close_file(self, pst: MailSource):
         for iid in [i for i, f in self.file_of_item.items() if f is pst]:
             self.file_of_item.pop(iid, None)
             self.folder_of_item.pop(iid, None)
@@ -583,7 +598,7 @@ class App(ttk.Frame):
         """OST contents tables carry an unreliable sender column (stale references),
         so the sender comes from the message itself; PSTs only need gaps filled.
         Runs in the background in batches and patches the visible rows as it goes."""
-        todo = [r for r in rows if not getattr(r, "_filled", False) and (not r.sender or r.pst.ndb.is_ost)]
+        todo = [r for r in rows if not getattr(r, "_filled", False) and (not r.sender or r.pst.sender_from_message)]
         if not todo:
             return
         self._fill_token += 1
@@ -598,7 +613,7 @@ class App(ttk.Frame):
                 for r in batch:
                     if token != self._fill_token:
                         return
-                    r.fill_from_message(force_sender=r.pst.ndb.is_ost)
+                    r.fill_from_message(force_sender=r.pst.sender_from_message)
                     r._filled = True
                 self.post(self._patch_rows, batch)
 
@@ -958,7 +973,8 @@ class App(ttk.Frame):
             else:
                 shown = str(val)
             shown = shown.replace("\r", " ").replace("\n", " ")
-            tv.insert("", "end", values=(f"0x{pid:04X}", name, f"0x{ptype:04X}", shown[:600]))
+            tv.insert("", "end", values=(f"0x{pid:04X}" if isinstance(pid, int) else "header", name,
+                                         f"0x{ptype:04X}" if isinstance(ptype, int) else "", shown[:600]))
 
         def _gone(_e=None, w=win):
             if self._inspector is w:
@@ -970,6 +986,10 @@ class App(ttk.Frame):
         pst = self.file_of_item.get(sel[0]) if sel else (self.files[-1] if self.files else None)
         if pst is None:
             messagebox.showinfo(APP, "Open a file first.")
+            return
+        if not isinstance(pst, PSTFile):
+            messagebox.showinfo(APP, "The orphan scan looks for messages a PST or OST's index still holds but no "
+                                     "folder lists. It does not apply to " + pst.kind_label + " sources.")
             return
 
         def work():
@@ -1016,16 +1036,16 @@ class App(ttk.Frame):
 
     def show_about(self):
         messagebox.showinfo(f"About {APP}",
-                            f"{APP} {VERSION}\n\nOpens Outlook PST and OST files directly - no Outlook, no MAPI - "
-                            "and exports messages as EML, MBOX, PDF, HTML, plain text or just the attachments, "
-                            "one at a time or thousands at once.\n\nThe file reader was written from Microsoft's "
-                            "[MS-PST] specification and handles ANSI (Outlook 97-2002), Unicode (2003+) and the "
-                            "4K-page OST format (2013+), including both 'encryption' modes.\n\n"
-                            "Everything runs on this computer. Nothing is uploaded anywhere.")
+                            f"{APP} {VERSION}\n\nOpens mailboxes in whatever form they come - Outlook PST and OST "
+                            "files, MBOX (including Thunderbird and Apple Mail folders), Maildir, and loose EML, "
+                            "EMLX and Outlook MSG files - and exports messages as EML, MBOX, PDF, HTML, plain text "
+                            "or just the attachments, one at a time or thousands at once.\n\nThe PST/OST and MSG "
+                            "readers were written from Microsoft's published specifications; no Outlook, MAPI or "
+                            "compiled library is involved.\n\nEverything runs on this computer. Nothing is uploaded anywhere.")
 
     def show_guide(self):
         win = tk.Toplevel(self.root)
-        win.title("How PST Exporter works")
+        win.title("How Mailex works")
         win.geometry("720x560")
         win.configure(bg=self.c["bg"])
         txt = tk.Text(win, wrap="word", padx=18, pady=16, relief="flat", background=self.c["panel"],
@@ -1043,10 +1063,13 @@ class App(ttk.Frame):
 
 
 GUIDE = [
-    ("Opening files", "File > Open picks one or more .pst / .ost files. File > Open a folder finds every PST and OST "
-                      "under a folder, however deep, and opens them all - that is the bulk route. The file is only "
-                      "ever read; nothing in it is changed. Files are opened read-only, so an OST still in use by "
-                      "Outlook may refuse to open until Outlook is closed."),
+    ("Opening files", "File > Open picks one or more files: Outlook .pst / .ost, .mbox, single .eml / .emlx / .msg "
+                      "messages. File > Open a folder works out what is inside it - PST and OST files, MBOX files "
+                      "(a Thunderbird profile's Mail folder with its .sbd sub-folders, or Apple Mail's exported "
+                      ".mbox packages), a Maildir (cur/new/tmp), or a tree of loose .eml / .msg / .emlx files whose "
+                      "directories become the folders - and opens all of it. That is the bulk route. Files are only "
+                      "ever read; nothing in them is changed. An OST still in use by Outlook may refuse to open until "
+                      "Outlook is closed."),
     ("Browsing", "The left pane lists each file's folders with message counts. Click a folder to list its messages; "
                  "tick Subfolders to include everything beneath it. Search filters the list by subject, sender and "
                  "recipient. Click a column heading to sort. A single click previews the message; the attachments "
@@ -1062,12 +1085,23 @@ GUIDE = [
     ("Folder structure", "By default the PST's folder tree is recreated under the export folder, with one folder per "
                          "file when several are exported at once. Untick 'Keep folder structure' to put everything in "
                          "one place. File names are 'date time subject' so they sort chronologically."),
+    ("Fidelity", "Messages that arrived as real RFC 822 bytes (MBOX, EML, Maildir) are exported to EML and MBOX "
+                 "byte for byte. PST and MSG messages are rebuilt into standard MIME from their MAPI properties, "
+                 "keeping the original transport headers where the file kept them."),
     ("What cannot be read", "Attachments that were links to files on the original computer have no content in the "
                             "PST. Password-protected PSTs open fine (the password only guards Outlook's UI), but "
                             "files using Windows EFS-style encryption cannot be read without the original key."),
     ("Where files go", "Exports go to your Downloads folder unless you choose another location in the export "
                        "dialog, or set a default under File > Default save folder."),
 ]
+
+
+def _count_folders(src: MailSource):
+    """Non-PST sources only know their message counts once the folder is read."""
+    if isinstance(src, PSTFile):
+        return
+    for f in src.root.walk():
+        f.messages()
 
 
 def _is_mailish(mc: str) -> bool:
@@ -1111,7 +1145,7 @@ class ExportDialog(tk.Toplevel):
             r += 1
 
         ttk.Label(body, text="Save into", style="Field.TLabel").grid(row=r, column=0, sticky="w", pady=(12, 4))
-        self.out = tk.StringVar(value=app.settings.get("save_dir_export") or os.path.join(default_save_dir(app.settings), "PST export"))
+        self.out = tk.StringVar(value=app.settings.get("save_dir_export") or os.path.join(default_save_dir(app.settings), "Mailex export"))
         ent = ttk.Entry(body, textvariable=self.out, width=58)
         ent.grid(row=r, column=1, sticky="ew", pady=(12, 4))
         ttk.Button(body, text="Browse…", command=self._browse).grid(row=r, column=2, sticky="w", padx=(6, 0), pady=(12, 4))

@@ -469,7 +469,7 @@ def _write_message(w: PSTWriter, m: SynthMessage, nid: int, parent_nid: int, emb
         mapi.PR_DISPLAY_CC: (mapi.PT_UNICODE, "; ".join(n for n, _a in m.cc)),
         mapi.PR_IMPORTANCE: (mapi.PT_LONG, 1),
         mapi.PR_MESSAGE_SIZE: (mapi.PT_LONG, len(m.body) + len(m.html) + sum(len(a[1]) for a in m.attachments) + 500),
-        mapi.PR_INTERNET_MESSAGE_ID: (mapi.PT_UNICODE, f"<synth-{nid:x}@pst-exporter.test>"),
+        mapi.PR_INTERNET_MESSAGE_ID: (mapi.PT_UNICODE, f"<synth-{nid:x}@mailex.test>"),
     }
     if m.body:
         props[mapi.PR_BODY] = (mapi.PT_UNICODE, m.body)
@@ -606,4 +606,215 @@ def write_pst(path: str, root_folders: List[SynthFolder], store_name: str = "Syn
     root = SynthFolder("", subfolders=root_folders)
     write_folder(0x122, root, 0x122)
     w.write(path)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# a compound file (OLE2) and .msg writer - again test-only
+# ---------------------------------------------------------------------------
+class _Node:
+    def __init__(self, name: str, data: Optional[bytes] = None):
+        self.name = name
+        self.data = data          # None = storage
+        self.kids: List["_Node"] = []
+        self.index = -1
+        self.start = 0xFFFFFFFE
+
+    def storage(self, name: str) -> "_Node":
+        n = _Node(name)
+        self.kids.append(n)
+        return n
+
+    def stream(self, name: str, data: bytes) -> "_Node":
+        n = _Node(name, data)
+        self.kids.append(n)
+        return n
+
+
+def write_compound_file(path: str, root: _Node, sector_size: int = 512):
+    """A version-3 compound file. Directory trees are written as right-hand
+    chains (valid to read, if not balanced), small streams go in the mini stream."""
+    MINI = 64
+    CUTOFF = 4096
+    ENDOFCHAIN, FREESECT, FATSECT = 0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFD
+    per = sector_size // 4
+    # number the entries: root first, then depth-first
+    entries: List[_Node] = []
+
+    def number(n: _Node):
+        n.index = len(entries)
+        entries.append(n)
+        for k in n.kids:
+            number(k)
+    number(root)
+    # mini stream
+    mini = bytearray()
+    minifat: List[int] = []
+    for e in entries:
+        if e is root or e.data is None or len(e.data) == 0 or len(e.data) >= CUTOFF:
+            continue
+        first = len(minifat)
+        nsec = -(-len(e.data) // MINI)
+        for i in range(nsec):
+            minifat.append(first + i + 1 if i < nsec - 1 else ENDOFCHAIN)
+        mini += e.data.ljust(nsec * MINI, b"\x00")
+        e.start = first
+    # big streams (including the mini stream itself as the root's data)
+    fat: List[int] = []
+    sectors: List[bytes] = []
+
+    def add_big(data: bytes) -> int:
+        if not data:
+            return ENDOFCHAIN
+        nsec = -(-len(data) // sector_size)
+        first = len(sectors)
+        for i in range(nsec):
+            sectors.append(data[i * sector_size:(i + 1) * sector_size].ljust(sector_size, b"\x00"))
+            fat.append(first + i + 1 if i < nsec - 1 else ENDOFCHAIN)
+        return first
+    for e in entries:
+        if e is root or e.data is None or len(e.data) < CUTOFF:
+            continue
+        e.start = add_big(e.data)
+    root.data = bytes(mini)
+    root.start = add_big(root.data) if mini else ENDOFCHAIN
+    mf = b"".join(struct.pack("<I", v) for v in minifat)
+    first_minifat = add_big(mf)
+    num_minifat = -(-len(mf) // sector_size) if mf else 0
+    # directory
+    dir_entries = []
+    for e in entries:
+        name = (e.name + "\x00").encode("utf-16-le")
+        left = FREESECT
+        right = FREESECT
+        child = FREESECT
+        parent = next((p for p in entries if e in p.kids), None)
+        if parent is not None:
+            sib = parent.kids
+            i = sib.index(e)
+            if i + 1 < len(sib):
+                right = sib[i + 1].index
+        if e.kids:
+            child = e.kids[0].index
+        etype = 5 if e is root else (1 if e.data is None else 2)
+        size = len(e.data) if e.data is not None else 0
+        rec = name.ljust(64, b"\x00") + struct.pack("<HBBIII", len(name), etype, 1, left, right, child)
+        rec += b"\x00" * 16 + struct.pack("<I", 0) + b"\x00" * 16 + struct.pack("<IQ", e.start if size or e is root else ENDOFCHAIN, size)
+        assert len(rec) == 128
+        dir_entries.append(rec)
+    dirdata = b"".join(dir_entries)
+    first_dir = add_big(dirdata)
+    # FAT sectors: mark them, then write them
+    nfat = -(-(len(fat) + 1) // per)
+    while -(-(len(fat) + nfat) // per) > nfat:
+        nfat += 1
+    fat_first = len(sectors)
+    for i in range(nfat):
+        fat.append(FATSECT)
+        sectors.append(b"")
+    padded = fat + [FREESECT] * (nfat * per - len(fat))
+    fatbytes = b"".join(struct.pack("<I", v) for v in padded)
+    for i in range(nfat):
+        sectors[fat_first + i] = fatbytes[i * sector_size:(i + 1) * sector_size]
+    hdr = bytearray(512)
+    hdr[0:8] = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+    struct.pack_into("<HHHHH", hdr, 0x18, 0x3E, 3, 0xFFFE, 9, 6)
+    struct.pack_into("<IIIIIIII", hdr, 0x2C, nfat, first_dir, 0, CUTOFF, first_minifat, num_minifat, ENDOFCHAIN, 0)
+    difat = [fat_first + i for i in range(nfat)] + [FREESECT] * (109 - nfat)
+    struct.pack_into("<109I", hdr, 0x4C, *difat)
+    with open(path, "wb") as fh:
+        fh.write(bytes(hdr))
+        for s in sectors:
+            fh.write(s)
+
+
+def _msg_props(st: _Node, props: Dict[int, Tuple[int, object]], header: bytes):
+    """Write a property set into a storage: substg streams plus the properties stream."""
+    body = bytearray()
+    for pid, (ptype, value) in sorted(props.items()):
+        if ptype in mapi.FIXED_SIZES and mapi.FIXED_SIZES[ptype] <= 8 or ptype == mapi.PT_BOOLEAN:
+            data = encode_value(ptype, value)
+            body += struct.pack("<II", (pid << 16) | ptype, 6) + data.ljust(8, b"\x00")[:8]
+        else:
+            data = encode_value(ptype, value)
+            if ptype in (mapi.PT_UNICODE,):
+                data += b"\x00\x00"
+            elif ptype == mapi.PT_STRING8:
+                data += b"\x00"
+            st.stream(f"__substg1.0_{pid:04X}{ptype:04X}", data)
+            body += struct.pack("<II", (pid << 16) | ptype, 6) + struct.pack("<II", len(data), 0)
+    st.stream("__properties_version1.0", header + bytes(body))
+
+
+def build_msg_tree(m: SynthMessage, st: _Node, embedded: bool = False):
+    props: Dict[int, Tuple[int, object]] = {
+        mapi.PR_MESSAGE_CLASS: (mapi.PT_UNICODE, m.message_class),
+        mapi.PR_SUBJECT: (mapi.PT_UNICODE, m.subject),
+        mapi.PR_SENDER_NAME: (mapi.PT_UNICODE, m.sender),
+        mapi.PR_SENDER_EMAIL: (mapi.PT_UNICODE, m.sender_email),
+        mapi.PR_SENDER_ADDRTYPE: (mapi.PT_UNICODE, "SMTP"),
+        mapi.PR_MESSAGE_DELIVERY_TIME: (mapi.PT_SYSTIME, m.date),
+        mapi.PR_CLIENT_SUBMIT_TIME: (mapi.PT_SYSTIME, m.date),
+        mapi.PR_MESSAGE_FLAGS: (mapi.PT_LONG, (1 if m.read else 0) | (0x10 if (m.attachments or m.embedded) else 0)),
+        mapi.PR_HASATTACH: (mapi.PT_BOOLEAN, bool(m.attachments or m.embedded)),
+        mapi.PR_DISPLAY_TO: (mapi.PT_UNICODE, "; ".join(n for n, _a in m.to)),
+        mapi.PR_IMPORTANCE: (mapi.PT_LONG, 1),
+        mapi.PR_MESSAGE_CODEPAGE: (mapi.PT_LONG, 1252),
+        0x340D: (mapi.PT_LONG, 0x40000),        # PR_STORE_SUPPORT_MASK: unicode strings
+    }
+    if m.body:
+        props[mapi.PR_BODY] = (mapi.PT_UNICODE, m.body)
+    if m.html:
+        props[mapi.PR_HTML] = (mapi.PT_BINARY, m.html.encode("utf-8"))
+        props[mapi.PR_INTERNET_CPID] = (mapi.PT_LONG, 65001)
+    if m.rtf:
+        props[mapi.PR_RTF_COMPRESSED] = (mapi.PT_BINARY, m.rtf)
+    if m.headers:
+        props[mapi.PR_TRANSPORT_HEADERS] = (mapi.PT_UNICODE, m.headers)
+    props.update(m.extra)
+    recips = [(1, n, a) for n, a in m.to] + [(2, n, a) for n, a in m.cc]
+    natt = len(m.attachments) + (1 if m.embedded else 0)
+    if embedded:
+        header = b"\x00" * 8 + struct.pack("<IIII", len(recips), natt, len(recips), natt)
+    else:
+        header = b"\x00" * 8 + struct.pack("<IIII", len(recips), natt, len(recips), natt) + b"\x00" * 8
+    _msg_props(st, props, header)
+    st.storage("__nameid_version1.0")
+    for i, (kind, name, addr) in enumerate(recips):
+        rs = st.storage(f"__recip_version1.0_#{i:08X}")
+        _msg_props(rs, {mapi.PR_RECIPIENT_TYPE: (mapi.PT_LONG, kind), mapi.PR_DISPLAY_NAME: (mapi.PT_UNICODE, name),
+                        mapi.PR_ADDRTYPE: (mapi.PT_UNICODE, "SMTP"), mapi.PR_EMAIL_ADDRESS: (mapi.PT_UNICODE, addr),
+                        mapi.PR_SMTP_ADDRESS: (mapi.PT_UNICODE, addr), 0x3000: (mapi.PT_LONG, i)}, b"\x00" * 8)
+    ai = 0
+    for att in m.attachments:
+        fname, data, mime = att[0], att[1], att[2]
+        cid = att[3] if len(att) > 3 else ""
+        a = st.storage(f"__attach_version1.0_#{ai:08X}")
+        ai += 1
+        ap = {mapi.PR_ATTACH_METHOD: (mapi.PT_LONG, mapi.ATTACH_BY_VALUE),
+              mapi.PR_ATTACH_LONG_FILENAME: (mapi.PT_UNICODE, fname),
+              mapi.PR_ATTACH_FILENAME: (mapi.PT_UNICODE, fname[:8]),
+              mapi.PR_ATTACH_MIME_TAG: (mapi.PT_UNICODE, mime),
+              mapi.PR_ATTACH_SIZE: (mapi.PT_LONG, len(data) + 200),
+              mapi.PR_ATTACH_DATA: (mapi.PT_BINARY, data),
+              mapi.PR_RENDERING_POSITION: (mapi.PT_LONG, -1)}
+        if cid:
+            ap[mapi.PR_ATTACH_CONTENT_ID] = (mapi.PT_UNICODE, cid)
+            ap[mapi.PR_ATTACHMENT_HIDDEN] = (mapi.PT_BOOLEAN, True)
+        _msg_props(a, ap, b"\x00" * 8)
+    if m.embedded is not None:
+        a = st.storage(f"__attach_version1.0_#{ai:08X}")
+        ap = {mapi.PR_ATTACH_METHOD: (mapi.PT_LONG, mapi.ATTACH_EMBEDDED_MSG),
+              mapi.PR_ATTACH_LONG_FILENAME: (mapi.PT_UNICODE, m.embedded.subject + ".eml"),
+              mapi.PR_DISPLAY_NAME: (mapi.PT_UNICODE, m.embedded.subject),
+              mapi.PR_RENDERING_POSITION: (mapi.PT_LONG, -1)}
+        _msg_props(a, ap, b"\x00" * 8)
+        inner = a.storage("__substg1.0_3701000D")
+        build_msg_tree(m.embedded, inner, embedded=True)
+
+
+def write_msg(path: str, m: SynthMessage):
+    root = _Node("Root Entry")
+    build_msg_tree(m, root)
+    write_compound_file(path, root)
     return path
