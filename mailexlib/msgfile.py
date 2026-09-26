@@ -275,6 +275,16 @@ class MsgMessage(PropertyMessage):
     def message_class(self) -> str:
         return self.text(mapi.PR_MESSAGE_CLASS) or "IPM.Note"
 
+    def name_map(self):
+        """The file's name-to-id table lives at the top level of the compound file
+        (embedded messages share it), so it is cached on the CompoundFile."""
+        nm = getattr(self.cf, "_name_map", None)
+        if nm is None:
+            from .namedprops import NameMap
+            nm = NameMap.from_msg_root(self.cf.root)
+            self.cf._name_map = nm
+        return nm
+
     @property
     def size(self) -> int:
         v = self.get(mapi.PR_MESSAGE_SIZE)

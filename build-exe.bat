@@ -51,6 +51,7 @@ if exist "%~dp0dist" rmdir /s /q "%~dp0dist"
   --name "Mailex" ^
   --collect-all reportlab ^
   --collect-all PIL ^
+  --collect-all tkinterdnd2 ^
   --collect-submodules mailexlib ^
   --hidden-import tkinter ^
   --hidden-import tkinter.ttk ^

@@ -5,6 +5,7 @@ import os
 import queue
 import sys
 import threading
+import time
 import traceback
 import webbrowser
 from typing import Dict, List, Optional, Tuple
@@ -12,13 +13,18 @@ from typing import Dict, List, Optional, Tuple
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from . import theme
+from . import contacts as _contacts
+from . import dnd, theme
 from .export import FORMATS, ExportOptions, ExportResult, Exporter, eml_bytes, human_size, local, sanitize
+from .filters import ATT_TYPE_LABELS, ATT_TYPES, RowFilter, parse_date_bound, parse_extensions
 from .message import Folder, Message, MessageRow, PSTFile
 from .paths import APP, VERSION, default_save_dir, downloads_dir, load_settings, save_settings
 from .sources import FILE_TYPES, MailSource, find_sources, open_found, open_source
 
 _HIDE_FOLDERS = {"IPM_SUBTREE"}  # shown flattened - their children matter, they do not
+_OPEN_HINT = "Open a mailbox to begin - PST, OST, MBOX, Thunderbird, Apple Mail, Maildir, EML or MSG."
+BODY_CACHE_CHARS = 65536            # of body text kept per message for "search bodies too"
+BODY_CACHE_BUDGET = 400_000_000     # total characters before later bodies are kept short (8 KB)
 
 
 class App(ttk.Frame):
@@ -43,6 +49,23 @@ class App(ttk.Frame):
         self.include_sub = tk.BooleanVar(value=bool(self.settings.get("include_subfolders", False)))
         self.only_mail = tk.BooleanVar(value=bool(self.settings.get("only_mail", False)))
         self.search_var = tk.StringVar()
+        self.body_var = tk.BooleanVar(value=False)
+        self.from_var = tk.StringVar()
+        self.to_var = tk.StringVar()
+        self.has_att_var = tk.BooleanVar(value=False)
+        self.att_type_var = tk.StringVar(value=ATT_TYPE_LABELS["all"])
+        self.contacts_var = tk.BooleanVar(value=False)
+        # per-row details the listing does not carry, read in the background:
+        # id(row) -> [row, body text or None, [(name, inline, size)] or None]
+        self._details: Dict[int, list] = {}
+        self._details_chars = 0
+        self._details_token = 0
+        self._details_busy = False
+        self._details_job = (0, False, False)
+        self._last_filter_apply = 0.0
+        self._drag_folder = dnd.DragFolder()
+        self._press_item: Optional[str] = None
+        self._stats_win = None
         self._search_job = None
         self._list_token = 0
         self._preview_token = 0
@@ -101,6 +124,7 @@ class App(ttk.Frame):
                 f.close()
             except Exception:  # noqa: BLE001
                 pass
+        self._drag_folder.cleanup()
         self.root.destroy()
 
     def _on_close_after_cancel(self):
@@ -145,9 +169,13 @@ class App(ttk.Frame):
         v.add_checkbutton(label="Include subfolders in the list", variable=self.include_sub, command=self._refresh_list)
         v.add_checkbutton(label="Only show e-mail items (hide calendar, contacts, tasks)", variable=self.only_mail,
                           command=self._refresh_list)
+        v.add_checkbutton(label="Only show contacts", variable=self.contacts_var, command=self._contacts_toggled)
         v.add_separator()
+        v.add_command(label="Statistics…", accelerator="Ctrl+T", command=self.show_stats)
         v.add_command(label="Property inspector for this message", accelerator="Ctrl+I", command=self.show_inspector)
         v.add_command(label="Look for orphaned (deleted) messages in this file", command=self.find_orphans)
+        v.add_separator()
+        v.add_command(label="Clear all filters", command=self.clear_filters)
         m.add_cascade(label="View", menu=v)
         h = tk.Menu(m, tearoff=0)
         h.add_command(label="How it works", command=self.show_guide)
@@ -162,6 +190,7 @@ class App(ttk.Frame):
             self.root.bind(f"<{mod}-e>", lambda _e: self.export_dialog("selected"))
             self.root.bind(f"<{mod}-f>", lambda _e: self.search_entry.focus_set())
             self.root.bind(f"<{mod}-i>", lambda _e: self.show_inspector())
+            self.root.bind(f"<{mod}-t>", lambda _e: self.show_stats())
             self.root.bind(f"<{mod}-d>", lambda _e: self.toggle_theme())
         if sys.platform == "darwin":
             try:
@@ -176,6 +205,7 @@ class App(ttk.Frame):
     def _build(self):
         bar = ttk.Frame(self, padding=(12, 10, 12, 6))
         bar.pack(side="top", fill="x")
+        self.bar = bar
         ttk.Button(bar, text="Open files…", style="Accent.TButton", command=self.open_files).pack(side="left")
         ttk.Button(bar, text="Open folder…", command=self.open_folder).pack(side="left", padx=(6, 0))
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=12, pady=2)
@@ -185,11 +215,35 @@ class App(ttk.Frame):
         self.theme_btn = ttk.Button(bar, text="Light" if self.dark else "Dark", width=6, command=self.toggle_theme)
         self.theme_btn.pack(side="right")
         ttk.Checkbutton(bar, text="Subfolders", variable=self.include_sub, command=self._refresh_list).pack(side="right", padx=(0, 12))
-        ttk.Checkbutton(bar, text="E-mail only", variable=self.only_mail, command=self._refresh_list).pack(side="right", padx=(0, 8))
-        self.search_entry = ttk.Entry(bar, textvariable=self.search_var, width=30)
-        self.search_entry.pack(side="right", padx=(0, 12))
-        ttk.Label(bar, text="Search").pack(side="right", padx=(0, 6))
-        self.search_var.trace_add("write", lambda *_a: self._schedule_search())
+        ttk.Checkbutton(bar, text="E-mail only", variable=self.only_mail, command=self._mail_only_toggled).pack(side="right", padx=(0, 8))
+
+        # the filter row: everything here narrows the list without re-reading the folder
+        flt = ttk.Frame(self, padding=(12, 0, 12, 6))
+        flt.pack(side="top", fill="x")
+        self.filter_bar = flt
+        ttk.Label(flt, text="Search").pack(side="left", padx=(0, 6))
+        self.search_entry = ttk.Entry(flt, textvariable=self.search_var, width=26)
+        self.search_entry.pack(side="left")
+        self.search_entry.bind("<Escape>", lambda _e: self.search_var.set(""))
+        ttk.Checkbutton(flt, text="Search bodies too", variable=self.body_var, command=self._schedule_search).pack(side="left", padx=(6, 14))
+        ttk.Label(flt, text="From").pack(side="left", padx=(0, 4))
+        self.from_entry = ttk.Entry(flt, textvariable=self.from_var, width=11)
+        self.from_entry.pack(side="left")
+        ttk.Label(flt, text="To").pack(side="left", padx=(6, 4))
+        self.to_entry = ttk.Entry(flt, textvariable=self.to_var, width=11)
+        self.to_entry.pack(side="left", padx=(0, 14))
+        for ent in (self.from_entry, self.to_entry):
+            ent.bind("<Escape>", lambda _e, v=ent: v.delete(0, "end"))
+        ttk.Checkbutton(flt, text="Has attachments", variable=self.has_att_var, command=self._schedule_search).pack(side="left")
+        self.att_type_box = ttk.Combobox(flt, textvariable=self.att_type_var, state="readonly", width=15,
+                                         values=[ATT_TYPE_LABELS[k] for k in ATT_TYPES])
+        self.att_type_box.pack(side="left", padx=(6, 14))
+        self.att_type_box.bind("<<ComboboxSelected>>", lambda _e: self._att_type_chosen())
+        ttk.Checkbutton(flt, text="Contacts", variable=self.contacts_var, command=self._contacts_toggled).pack(side="left")
+        self.clear_btn = ttk.Button(flt, text="Clear", width=6, command=self.clear_filters)
+        self.clear_btn.pack(side="right")
+        for var in (self.search_var, self.from_var, self.to_var):
+            var.trace_add("write", lambda *_a: self._schedule_search())
 
         self.pane = ttk.Panedwindow(self, orient="horizontal")
         self.pane.pack(side="top", fill="both", expand=True, padx=12, pady=(0, 4))
@@ -224,6 +278,12 @@ class App(ttk.Frame):
         self.list.bind("<Control-a>", self._select_all)
         self.list.bind("<Double-1>", lambda _e: self.save_current_eml())
         self.vpane.add(top, weight=3)
+        # drag rows out of the list as .eml / .vcf files (needs tkinterdnd2)
+        self.drag_enabled = dnd.enable_drag_out(self.list, self.selected_rows, self._drag_folder,
+                                                lambda t: self.status_msg(t, "Good.TLabel"), self._drag_began)
+        if self.drag_enabled:
+            self.list.bind("<ButtonPress-1>", self._on_list_press)
+            self.list.bind("<ButtonRelease-1>", self._on_list_release)
 
         bottom = ttk.Frame(self.vpane, style="Panel.TFrame")
         self.preview_head = tk.Text(bottom, height=6, wrap="word", relief="flat", padx=10, pady=8)
@@ -246,13 +306,52 @@ class App(ttk.Frame):
         psb.pack(side="right", fill="y")
         self.vpane.add(bottom, weight=2)
 
-        self.status = ttk.Label(self, text="Open a PST or OST file to begin. Nothing is uploaded anywhere; "
-                                           "everything happens on this computer.",
+        self.status = ttk.Label(self, text=_OPEN_HINT + " Nothing is uploaded anywhere; everything happens on this computer."
+                                           + ("  You can also drop a mailbox file or folder onto this window."
+                                              if dnd.available() else ""),
                                 style="Dim.TLabel", padding=(16, 2, 16, 8), wraplength=1300)
         self.status.pack(side="bottom", fill="x")
         for text_w in (self.preview_head, self.preview):
             text_w.configure(state="disabled")
+        # drop a mailbox anywhere on the window to open it
+        self.drop_enabled = dnd.enable_drop_in([self.root, self, self.bar, self.filter_bar, self.tree, self.list,
+                                                self.preview, self.preview_head, self.status],
+                                               self._dropped, ignore=self._drag_folder.contains)
         self.after(300, self._restore_sashes)
+
+    def _dropped(self, paths: List[str]):
+        if self._busy_with_export():
+            return
+        self.open_paths(paths)
+
+    # -- dragging rows out: keep a multi-selection alive through the press --
+    def _on_list_press(self, e):
+        item = self.list.identify_row(e.y)
+        # Shift or Control (plus Command / Option on a Mac) mean the normal selection
+        # rules apply. Windows reports NumLock in the Mod1 bit, so it is not tested there.
+        mods = 0x1D if sys.platform == "darwin" else 0x05
+        if not item or (e.state & mods):
+            self._press_item = None
+            return None
+        sel = self.list.selection()
+        if item in sel and len(sel) > 1:
+            # a plain press on one of several selected rows would collapse the
+            # selection to that row before the drag could start; hold it until
+            # the release says it was just a click
+            self._press_item = item
+            return "break"
+        self._press_item = None
+        return None
+
+    def _on_list_release(self, e):
+        item = self._press_item
+        self._press_item = None
+        if item and self.list.identify_row(e.y) == item:
+            self.list.selection_set(item)
+            self.list.focus(item)
+
+    def _drag_began(self):
+        self._press_item = None
 
     def _restore_sashes(self):
         try:
@@ -272,11 +371,16 @@ class App(ttk.Frame):
         self.preview_head.tag_configure("subj", font=(self.ui, 12, "bold"))
         self.preview.tag_configure("dim", foreground=c["dim"])
         self.preview.tag_configure("mono", font=(self.mono, 9))
+        self.preview.tag_configure("k", foreground=c["dim"], font=(self.mono, 9, "bold"))
         self.att_list.configure(background=c["field"], foreground=c["field_text"], selectbackground=c["accent"],
                                 selectforeground=c["accent_text"], highlightthickness=1,
                                 highlightbackground=c["field_border"], highlightcolor=c["accent"], font=(self.ui, 9))
         self.list.tag_configure("unread", font=(self.ui, 10, "bold"))
         self.list.tag_configure("dim", foreground=c["dim"])
+        # a date entry that does not parse gets a red border
+        st = ttk.Style(self.root)
+        st.configure("Bad.TEntry", bordercolor=c["bad"], lightcolor=c["bad"], darkcolor=c["bad"])
+        st.map("Bad.TEntry", bordercolor=[("focus", c["bad"])], lightcolor=[("focus", c["bad"])], darkcolor=[("focus", c["bad"])])
         for menu in self.menus:
             try:
                 menu.configure(bg=c["panel"], fg=c["text"], activebackground=c["sel"],
@@ -420,6 +524,11 @@ class App(ttk.Frame):
         if not todo:
             self.status_msg("Those files are already open.")
             return
+        # a new file means a new session for the body / attachment cache
+        self._details_token += 1
+        self._details_busy = False
+        self._details.clear()
+        self._details_chars = 0
 
         def work():
             out = []
@@ -627,22 +736,148 @@ class App(ttk.Frame):
                 if r.subject:
                     self.list.set(iid, "subject", r.subject)
 
+    # ---------------------------------------------------------- filtering
+    def _current_filter(self) -> RowFilter:
+        since = parse_date_bound(self.from_var.get())
+        until = parse_date_bound(self.to_var.get(), end=True)
+        self.from_entry.configure(style="Bad.TEntry" if (self.from_var.get().strip() and since is None) else "TEntry")
+        self.to_entry.configure(style="Bad.TEntry" if (self.to_var.get().strip() and until is None) else "TEntry")
+        label = self.att_type_var.get()
+        kind = next((k for k, v in ATT_TYPE_LABELS.items() if v == label), "all")
+        return RowFilter(text=self.search_var.get(), search_body=bool(self.body_var.get()), since=since, until=until,
+                         has_attachments=bool(self.has_att_var.get()), attachment_type=kind,
+                         contacts_only=bool(self.contacts_var.get()))
+
+    def _body_of(self, row) -> Optional[str]:
+        d = self._details.get(id(row))
+        return d[1] if d else None
+
+    def _atts_of(self, row):
+        d = self._details.get(id(row))
+        if d and d[2] is not None:
+            return [(name, inline) for name, inline, _size in d[2]]
+        return None
+
     def _filtered(self, rows: List[MessageRow]) -> List[MessageRow]:
-        q = self.search_var.get().strip().lower()
-        if not q:
+        flt = self._current_filter()
+        if not flt.active and not flt.needs_body:
             return rows
-        terms = q.split()
-        out = []
-        for r in rows:
-            hay = f"{r.subject} {r.sender} {r.to}".lower()
-            if all(t in hay for t in terms):
-                out.append(r)
+        out = flt.apply(rows, body=self._body_of if flt.needs_body else None,
+                        atts=self._atts_of if flt.needs_attachment_names else None)
+        if flt.needs_body or flt.needs_attachment_names:
+            self._fill_details(rows, flt.needs_body, flt.needs_attachment_names)
         return out
 
     def _schedule_search(self):
         if self._search_job:
             self.after_cancel(self._search_job)
-        self._search_job = self.after(250, lambda: self._show_rows(self._filtered(self.current_rows)))
+        self._search_job = self.after(250, self._apply_filter_now)
+
+    def _apply_filter_now(self):
+        self._search_job = None
+        self._last_filter_apply = time.time()
+        self._show_rows(self._filtered(self.current_rows))
+
+    def clear_filters(self):
+        for v in (self.search_var, self.from_var, self.to_var):
+            v.set("")
+        for b in (self.body_var, self.has_att_var, self.contacts_var):
+            b.set(False)
+        self.att_type_var.set(ATT_TYPE_LABELS["all"])
+        self._details_token += 1          # stop a body read that only the filter wanted
+        self._details_busy = False
+        self._schedule_search()
+
+    def _contacts_toggled(self):
+        if self.contacts_var.get() and self.only_mail.get():
+            self.only_mail.set(False)      # the two would hide everything between them
+            self._refresh_list()
+            return
+        self._schedule_search()
+
+    def _mail_only_toggled(self):
+        if self.only_mail.get() and self.contacts_var.get():
+            self.contacts_var.set(False)
+        self._refresh_list()
+
+    def _att_type_chosen(self):
+        if self.att_type_var.get() != ATT_TYPE_LABELS["all"]:
+            self.has_att_var.set(True)
+        self._schedule_search()
+
+    # -- reading bodies / attachment names in the background ----------------
+    def _fill_details(self, rows: List[MessageRow], need_body: bool, need_atts: bool):
+        """Open messages in batches on a worker thread and cache what the filter
+        needs (body text capped per message, attachment names). Progress goes to
+        the status line; the filter is re-applied every couple of seconds and at
+        the end, so matches appear as they are found without the window freezing."""
+        todo = []
+        for r in rows:
+            d = self._details.get(id(r))
+            if (need_body and (d is None or d[1] is None)) or (need_atts and (d is None or d[2] is None)):
+                todo.append(r)
+        if not todo:
+            return
+        if self._details_busy and self._details_job == (self._list_token, need_body or self._details_job[1],
+                                                        need_atts or self._details_job[2]):
+            return                      # the running job already covers this
+        self._details_token += 1
+        token = self._details_token
+        list_token = self._list_token
+        self._details_busy = True
+        self._details_job = (list_token, need_body, need_atts)
+        total = len(todo)
+
+        def work():
+            done = 0
+            for i in range(0, total, 100):
+                if token != self._details_token or list_token != self._list_token:
+                    self.post(self._details_progress, (token, done, total, "aborted"))
+                    return
+                for r in todo[i:i + 100]:
+                    entry = self._details.setdefault(id(r), [r, None, None])
+                    try:
+                        m = r.open()
+                    except Exception:  # noqa: BLE001 - unreadable: remember that, do not retry every time
+                        entry[1] = entry[1] if entry[1] is not None else ""
+                        entry[2] = entry[2] if entry[2] is not None else []
+                        continue
+                    if need_body and entry[1] is None:
+                        cap = BODY_CACHE_CHARS if self._details_chars < BODY_CACHE_BUDGET else 8192
+                        try:
+                            text = m.best_text()[:cap]
+                        except Exception:  # noqa: BLE001
+                            text = ""
+                        entry[1] = text
+                        self._details_chars += len(text)
+                    if need_atts and entry[2] is None:
+                        try:
+                            entry[2] = [(a.filename, bool(a.hidden or a.is_inline), a.size or len(a.data or b""))
+                                        for a in m.attachments()]
+                        except Exception:  # noqa: BLE001
+                            entry[2] = []
+                done = min(total, i + 100)
+                self.post(self._details_progress, (token, done, total, done >= total))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _details_progress(self, arg):
+        token, done, total, finished = arg
+        if token != self._details_token:
+            return
+        if finished == "aborted":
+            # the listing changed under the job; whoever changed it has re-shown the rows
+            self._details_busy = False
+            return
+        what = "bodies" if self.body_var.get() else "attachment lists"
+        if finished:
+            self._details_busy = False
+            self._apply_filter_now()
+            return
+        self.status_msg(f"Reading {what} {done:,} / {total:,}…  (the list fills in as matches are found)")
+        if time.time() - self._last_filter_apply > 2.0:
+            self._apply_filter_now()
+            self.status_msg(f"Reading {what} {done:,} / {total:,}…  (the list fills in as matches are found)")
 
     def _sort_by(self, col: str):
         key, desc = self._sort
@@ -668,8 +903,10 @@ class App(ttk.Frame):
         self._pending_rows = rows
         self._insert_batch(0, self._show_token)
         n = len(rows)
-        if self.search_var.get().strip():
-            self.status_msg(f"{n} of {len(self.current_rows)} items match the search.")
+        flt = self._current_filter()
+        if flt.active or flt.needs_body:
+            reading = "  (still reading…)" if self._details_busy else ""
+            self.status_msg(f"{n:,} of {len(self.current_rows):,} items match: {flt.describe()}.{reading}")
 
     def _insert_batch(self, start: int, token: int):
         if token != self._show_token:
@@ -718,8 +955,16 @@ class App(ttk.Frame):
             msg = row.open()
             # touch the expensive bits on the worker thread
             text = msg.best_text()
-            atts = [(a.filename, a.size or len(a.data or b""), a.is_embedded_message) for a in msg.attachments()]
-            return msg, text, atts
+            atts = [(a.filename, a.size or len(a.data or b""), a.is_embedded_message, bool(a.hidden or a.is_inline))
+                    for a in msg.attachments()]
+            contact = _contacts.parse_contact(msg) if _contacts.is_contact(msg) else None
+            # what the preview read, the filters can reuse
+            entry = self._details.setdefault(id(row), [row, None, None])
+            if entry[1] is None:
+                entry[1] = text[:BODY_CACHE_CHARS]
+            if entry[2] is None:
+                entry[2] = [(n, inline, sz) for n, sz, _emb, inline in atts]
+            return msg, text, atts, contact
 
         def done(res):
             if token != self._preview_token:
@@ -728,9 +973,12 @@ class App(ttk.Frame):
                 self._clear_preview()
                 self._set_head([("subj", row.subject or "(no subject)"), ("", f"Could not open this message: {res}")])
                 return
-            msg, text, atts = res
+            msg, text, atts, contact = res
             self.current_message = msg
-            self._render_preview(msg, text, atts)
+            if contact is not None:
+                self._render_contact(msg, contact, atts)
+            else:
+                self._render_preview(msg, text, atts)
 
         self._run_bg(work, done)
 
@@ -779,12 +1027,48 @@ class App(ttk.Frame):
         if msg.warnings:
             self.preview.insert("end", "\n\n" + "\n".join("Note: " + x for x in msg.warnings), "dim")
         self.preview.configure(state="disabled")
+        self._show_attachment_row(atts)
+
+    def _show_attachment_row(self, atts):
         self.att_list.delete(0, "end")
-        for name, size, emb in atts:
+        for name, size, emb, _inline in atts:
             self.att_list.insert("end", f"{name}  ({human_size(size)}){'  [message]' if emb else ''}")
         self.att_list.configure(height=min(4, max(1, len(atts))))
         self.att_label.configure(text=f"Attachments ({len(atts)})" if atts else "No attachments")
         self.att_btn.configure(state="normal" if atts else "disabled")
+
+    def _render_contact(self, msg: Message, c, atts):
+        """A contact card: the parsed fields rather than the raw body."""
+        w = self.preview_head
+        w.configure(state="normal")
+        w.delete("1.0", "end")
+        w.insert("end", (c.name or "(unnamed contact)") + "\n", "subj")
+        line2 = ", ".join(x for x in (c.title, c.company) if x)
+        if line2:
+            w.insert("end", line2 + "\n")
+        if c.email:
+            w.insert("end", "E-mail  ", "k"); w.insert("end", c.email + "\n")
+        d = local(msg.date)
+        w.insert("end", "Modified  ", "k"); w.insert("end", (d.strftime("%a %d %b %Y %H:%M") if d else "unknown") + "    ")
+        w.insert("end", "Class  ", "k"); w.insert("end", msg.message_class + "    ")
+        if msg.folder is not None:
+            w.insert("end", "Folder  ", "k"); w.insert("end", msg.folder.path_str)
+        w.configure(state="disabled")
+        self.preview.configure(state="normal")
+        self.preview.delete("1.0", "end")
+        fields = _contacts.contact_fields(c)
+        width = max((len(k) for k, _v in fields), default=8) + 2
+        for k, v in fields:
+            self.preview.insert("end", k.ljust(width), "k")
+            self.preview.insert("end", v + "\n", "mono")
+        if c.notes:
+            self.preview.insert("end", "\nNotes\n", "k")
+            self.preview.insert("end", c.notes[:200000] + "\n")
+        notes = list(c.warnings) + list(msg.warnings)
+        if notes:
+            self.preview.insert("end", "\n" + "\n".join("Note: " + x for x in notes), "dim")
+        self.preview.configure(state="disabled")
+        self._show_attachment_row(atts)
 
     # ------------------------------------------------------ single saves
     def save_attachment(self):
@@ -868,7 +1152,7 @@ class App(ttk.Frame):
 
     def export_dialog(self, scope: str, preset_format: Optional[str] = None):
         if not self.files:
-            messagebox.showinfo(APP, "Open a PST or OST file first.")
+            messagebox.showinfo(APP, "Open a mailbox first.")
             return
         if self._busy_with_export():
             return
@@ -1034,6 +1318,19 @@ class App(ttk.Frame):
 
         self._run_bg(work, done, f"Scanning {pst.name} for orphaned messages…")
 
+    def show_stats(self):
+        if not self.files:
+            messagebox.showinfo(APP, "Open a mailbox first.")
+            return
+        if self._stats_win is not None:
+            try:
+                self._stats_win.lift()
+                self._stats_win.focus_set()
+                return
+            except tk.TclError:
+                self._stats_win = None
+        self._stats_win = StatsWindow(self)
+
     def show_about(self):
         messagebox.showinfo(f"About {APP}",
                             f"{APP} {VERSION}\n\nOpens mailboxes in whatever form they come - Outlook PST and OST "
@@ -1067,22 +1364,43 @@ GUIDE = [
                       "messages. File > Open a folder works out what is inside it - PST and OST files, MBOX files "
                       "(a Thunderbird profile's Mail folder with its .sbd sub-folders, or Apple Mail's exported "
                       ".mbox packages), a Maildir (cur/new/tmp), or a tree of loose .eml / .msg / .emlx files whose "
-                      "directories become the folders - and opens all of it. That is the bulk route. Files are only "
-                      "ever read; nothing in them is changed. An OST still in use by Outlook may refuse to open until "
-                      "Outlook is closed."),
+                      "directories become the folders - and opens all of it. That is the bulk route. You can also drop "
+                      "a mailbox file or folder onto the window. Files are only ever read; nothing in them is changed. "
+                      "An OST still in use by Outlook may refuse to open until Outlook is closed."),
     ("Browsing", "The left pane lists each file's folders with message counts. Click a folder to list its messages; "
-                 "tick Subfolders to include everything beneath it. Search filters the list by subject, sender and "
-                 "recipient. Click a column heading to sort. A single click previews the message; the attachments "
-                 "row lets you save any one of them."),
+                 "tick Subfolders to include everything beneath it. Click a column heading to sort. A single click "
+                 "previews the message; the attachments row lets you save any one of them. Contacts preview as a "
+                 "card - name, company, e-mail addresses, phones, addresses - rather than as raw text."),
+    ("Filtering", "The filter row narrows the list without re-reading the folder. Search matches every word you type "
+                  "against subject, sender and recipients; tick 'Search bodies too' and the message text is searched "
+                  "as well (messages are read in the background and the list fills in as matches turn up - the status "
+                  "line shows progress). From / To take a year (2019), a month (2019-03) or a day (2019-03-15); From "
+                  "means the start of that period and To its end, and undated items only show when both are blank. "
+                  "'Has attachments' keeps messages with attachments, and the box beside it narrows that to documents, "
+                  "images, archives or other files (inline pictures such as signature logos do not count). 'Contacts' "
+                  "shows contact items only; 'E-mail only' hides calendar, contact, task and note items. Clear resets "
+                  "the lot. Whatever is listed is what 'Export selected' takes when nothing is selected."),
     ("Selecting", "Click, Shift-click and Ctrl-click (Cmd-click on a Mac) select messages in the list; Ctrl+A "
                   "selects everything listed. Export selected… writes those. Export folder… takes the folder in the "
                   "left pane with all of its subfolders, and Export everything… takes every open file."),
+    ("Drag and drop", "Drag selected messages out of the list and drop them on the desktop, a Finder or Explorer window, "
+                      "or any folder: they arrive as .eml files (contacts as .vcf). Up to 200 messages per drag; for "
+                      "more, use Export selected. Dropping a mailbox file or folder onto the window opens it. "
+                      "Both need the tkinterdnd2 package, which the build scripts include."),
     ("Formats", "EML is the standard single-message format that Outlook, Apple Mail and Thunderbird open directly; "
                 "attachments are embedded. MBOX puts a whole folder in one file for importing into Thunderbird or "
                 "Apple Mail. PDF, HTML and plain text are for reading and evidence bundles - attachments are saved "
-                "in a folder beside each message. Attachments only extracts just the files. Every export writes an "
-                "index.csv and index.json listing what was written, and export-log.txt if anything went wrong."),
-    ("Folder structure", "By default the PST's folder tree is recreated under the export folder, with one folder per "
+                "in a folder beside each message. Attachments only extracts just the files, optionally only certain "
+                "extensions or kinds and without inline pictures. Contacts (vCard + CSV) writes one .vcf per contact "
+                "plus a combined contacts.vcf and a contacts.csv at the top of the export, ready to import into Apple "
+                "Contacts, Outlook or Google; in every other format contacts also get their .vcf written alongside. "
+                "Every export writes an index.csv and index.json listing what was written, and export-log.txt if "
+                "anything went wrong."),
+    ("Statistics", "View > Statistics (Ctrl+T) sums up the listed folder or everything open: messages per year and "
+                   "month, top senders and sender domains, per-folder counts and sizes, the largest messages, "
+                   "read/unread, item kinds, and attachment counts once the attachment lists have been read. Save "
+                   "it as one CSV per table or as a single HTML page."),
+    ("Folder structure", "By default the mailbox's folder tree is recreated under the export folder, with one folder per "
                          "file when several are exported at once. Untick 'Keep folder structure' to put everything in "
                          "one place. File names are 'date time subject' so they sort chronologically."),
     ("Fidelity", "Messages that arrived as real RFC 822 bytes (MBOX, EML, Maildir) are exported to EML and MBOX "
@@ -1134,7 +1452,11 @@ class ExportDialog(tk.Toplevel):
         self.transient(app.root)
         body = ttk.Frame(self, padding=18)
         body.pack(fill="both", expand=True)
-        ttk.Label(body, text=f"Export {desc}", style="Title.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+        n_contacts = sum(1 for r in rows if _contacts.is_contact_class(r.message_class))
+        title = f"Export {desc}"
+        if n_contacts:
+            title += f"  ({n_contacts} contact{'s' if n_contacts != 1 else ''} among them)"
+        ttk.Label(body, text=title, style="Title.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
 
         ttk.Label(body, text="Format", style="Field.TLabel").grid(row=1, column=0, sticky="w", pady=4)
         self.fmt = tk.StringVar(value=fmt if fmt in FORMATS else "eml")
@@ -1151,21 +1473,44 @@ class ExportDialog(tk.Toplevel):
         ttk.Button(body, text="Browse…", command=self._browse).grid(row=r, column=2, sticky="w", padx=(6, 0), pady=(12, 4))
         r += 1
 
-        self.mirror = tk.BooleanVar(value=bool(app.settings.get("opt_mirror", True)))
-        self.atts = tk.BooleanVar(value=bool(app.settings.get("opt_atts", True)))
-        self.single_pdf = tk.BooleanVar(value=bool(app.settings.get("opt_single_pdf", False)))
+        st = app.settings
+        self.mirror = tk.BooleanVar(value=bool(st.get("opt_mirror", True)))
+        self.atts = tk.BooleanVar(value=bool(st.get("opt_atts", True)))
+        self.single_pdf = tk.BooleanVar(value=bool(st.get("opt_single_pdf", False)))
         self.only_mail = tk.BooleanVar(value=bool(app.only_mail.get()))
-        self.att_sub = tk.BooleanVar(value=bool(app.settings.get("opt_att_sub", True)))
-        self.cb_mirror = ttk.Checkbutton(body, text="Keep the folder structure (one folder per file, then the PST's own folders)", variable=self.mirror)
+        self.att_sub = tk.BooleanVar(value=bool(st.get("opt_att_sub", True)))
+        self.vcard = tk.BooleanVar(value=bool(st.get("opt_vcard", True)))
+        self.skip_inline = tk.BooleanVar(value=bool(st.get("opt_skip_inline", False)))
+        self.att_ext = tk.StringVar(value=str(st.get("opt_att_ext", "")))
+        self.att_kind = tk.StringVar(value=app.att_type_var.get())
+        self.cb_mirror = ttk.Checkbutton(body, text="Keep the folder structure (one folder per file, then the mailbox's own folders)", variable=self.mirror)
         self.cb_mirror.grid(row=r, column=1, columnspan=2, sticky="w", pady=(8, 1)); r += 1
         self.cb_atts = ttk.Checkbutton(body, text="Include attachments (embedded in EML / MBOX; saved beside PDF, HTML and text)", variable=self.atts)
         self.cb_atts.grid(row=r, column=1, columnspan=2, sticky="w", pady=1); r += 1
         self.cb_single = ttk.Checkbutton(body, text="PDF: put every message in ONE combined PDF instead of one file each", variable=self.single_pdf)
         self.cb_single.grid(row=r, column=1, columnspan=2, sticky="w", pady=1); r += 1
-        self.cb_attsub = ttk.Checkbutton(body, text="Attachments only: a folder per message (untick to pool them together)", variable=self.att_sub)
-        self.cb_attsub.grid(row=r, column=1, columnspan=2, sticky="w", pady=1); r += 1
+        self.cb_vcard = ttk.Checkbutton(body, text="Contacts: also write a .vcf beside each contact, plus contacts.vcf and contacts.csv at the top",
+                                        variable=self.vcard)
+        self.cb_vcard.grid(row=r, column=1, columnspan=2, sticky="w", pady=1); r += 1
         self.cb_mail = ttk.Checkbutton(body, text="Skip calendar, contact, task and note items - e-mail only", variable=self.only_mail)
         self.cb_mail.grid(row=r, column=1, columnspan=2, sticky="w", pady=1); r += 1
+        self.cb_attsub = ttk.Checkbutton(body, text="Attachments only: a folder per message (untick to pool them together)", variable=self.att_sub)
+        self.cb_attsub.grid(row=r, column=1, columnspan=2, sticky="w", pady=(8, 1)); r += 1
+        self.cb_inline = ttk.Checkbutton(body, text="Attachments only: skip inline pictures (signature logos, embedded images)", variable=self.skip_inline)
+        self.cb_inline.grid(row=r, column=1, columnspan=2, sticky="w", pady=1); r += 1
+        af = ttk.Frame(body)
+        af.grid(row=r, column=1, columnspan=2, sticky="w", pady=1); r += 1
+        self.lbl_kind = ttk.Label(af, text="Attachments only: keep")
+        self.lbl_kind.pack(side="left")
+        self.box_kind = ttk.Combobox(af, textvariable=self.att_kind, state="readonly", width=15,
+                                     values=[ATT_TYPE_LABELS[k] for k in ATT_TYPES])
+        self.box_kind.pack(side="left", padx=(6, 12))
+        self.lbl_ext = ttk.Label(af, text="only these extensions")
+        self.lbl_ext.pack(side="left")
+        self.ent_ext = ttk.Entry(af, textvariable=self.att_ext, width=22)
+        self.ent_ext.pack(side="left", padx=(6, 0))
+        self.lbl_ext2 = ttk.Label(af, text="(e.g. pdf, docx, xlsx - blank for all)", style="Dim.TLabel")
+        self.lbl_ext2.pack(side="left", padx=(6, 0))
 
         btns = ttk.Frame(body)
         btns.grid(row=r, column=0, columnspan=3, sticky="e", pady=(16, 0))
@@ -1184,9 +1529,16 @@ class ExportDialog(tk.Toplevel):
 
     def _sync(self):
         f = self.fmt.get()
+        att_only = f == "attachments"
         self.cb_single.configure(state="normal" if f == "pdf" else "disabled")
-        self.cb_attsub.configure(state="normal" if f == "attachments" else "disabled")
-        self.cb_atts.configure(state="disabled" if f == "attachments" else "normal")
+        self.cb_attsub.configure(state="normal" if att_only else "disabled")
+        self.cb_inline.configure(state="normal" if att_only else "disabled")
+        self.box_kind.configure(state="readonly" if att_only else "disabled")
+        self.ent_ext.configure(state="normal" if att_only else "disabled")
+        self.cb_atts.configure(state="disabled" if att_only or f == "vcf" else "normal")
+        self.cb_vcard.configure(state="disabled" if f == "vcf" else "normal")
+        self.cb_mail.configure(state="disabled" if f == "vcf" else "normal")
+        self.cb_mirror.configure(state="normal")
 
     def _browse(self):
         d = filedialog.askdirectory(title="Save the export into", initialdir=self.out.get() or default_save_dir(self.app.settings), parent=self)
@@ -1203,13 +1555,180 @@ class ExportDialog(tk.Toplevel):
         except OSError as exc:
             messagebox.showerror(APP, f"That folder cannot be created:\n{exc}", parent=self)
             return
-        opts = ExportOptions(fmt=self.fmt.get(), out_dir=out, mirror_folders=bool(self.mirror.get()),
+        kind = next((k for k, v in ATT_TYPE_LABELS.items() if v == self.att_kind.get()), "all")
+        exts = parse_extensions(self.att_ext.get())
+        fmt = self.fmt.get()
+        opts = ExportOptions(fmt=fmt, out_dir=out, mirror_folders=bool(self.mirror.get()),
                              include_attachments=bool(self.atts.get()), pdf_single_file=bool(self.single_pdf.get()),
-                             only_email=bool(self.only_mail.get()), attachments_subfolder=bool(self.att_sub.get()))
+                             only_email=bool(self.only_mail.get()) and fmt != "vcf",
+                             attachments_subfolder=bool(self.att_sub.get()),
+                             contacts_vcard=bool(self.vcard.get()),
+                             attachment_extensions=(exts or None) if fmt == "attachments" else None,
+                             attachment_types=({kind} if kind != "all" else None) if fmt == "attachments" else None,
+                             skip_inline_images=bool(self.skip_inline.get()) and fmt == "attachments")
         self.app.settings.update(opt_mirror=opts.mirror_folders, opt_atts=opts.include_attachments,
-                                 opt_single_pdf=opts.pdf_single_file, opt_att_sub=opts.attachments_subfolder)
+                                 opt_single_pdf=opts.pdf_single_file, opt_att_sub=opts.attachments_subfolder,
+                                 opt_vcard=bool(self.vcard.get()), opt_skip_inline=bool(self.skip_inline.get()),
+                                 opt_att_ext=self.att_ext.get().strip())
         self.destroy()
         self.app.run_export(self.rows, opts)
+
+
+class StatsWindow(tk.Toplevel):
+    """View > Statistics: tables over the rows already listed (or everything
+    open), each on its own tab, with CSV and HTML export."""
+
+    def __init__(self, app: App):
+        super().__init__(app.root)
+        self.app = app
+        self.title("Mailbox statistics")
+        self.geometry("980x640")
+        self.configure(bg=app.c["bg"])
+        self.transient(app.root)
+        self.stats = None
+        self.rows: List[MessageRow] = []
+        top = ttk.Frame(self, padding=(14, 12, 14, 6))
+        top.pack(side="top", fill="x")
+        ttk.Label(top, text="Statistics for", style="Field.TLabel").pack(side="left")
+        n_listed = len(app.current_rows)
+        self.scope = tk.StringVar(value=f"the listed folder ({n_listed:,} items)" if n_listed else "everything open")
+        self.scope_box = ttk.Combobox(top, textvariable=self.scope, state="readonly", width=34,
+                                      values=[f"the listed folder ({n_listed:,} items)", "everything open"])
+        self.scope_box.pack(side="left", padx=(8, 14))
+        self.scope_box.bind("<<ComboboxSelected>>", lambda _e: self._compute())
+        self.att_btn = ttk.Button(top, text="Read attachment details…", command=self._read_attachments)
+        self.att_btn.pack(side="left")
+        ttk.Button(top, text="Save as HTML…", command=self._save_html).pack(side="right")
+        ttk.Button(top, text="Save as CSV…", command=self._save_csv).pack(side="right", padx=(0, 8))
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(side="top", fill="both", expand=True, padx=14, pady=(4, 6))
+        self.status = ttk.Label(self, text="", style="Dim.TLabel", padding=(16, 2, 16, 8))
+        self.status.pack(side="bottom", fill="x")
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self._compute()
+
+    def _scope_rows(self):
+        if self.scope.get().startswith("the listed"):
+            return list(self.app.current_rows), (self.app.current_folder.path_str if self.app.current_folder else "listed folder")
+        return None, "everything open"
+
+    def _att_info(self, row):
+        d = self.app._details.get(id(row))
+        if d and d[2] is not None:
+            return [(name, size) for name, inline, size in d[2] if not inline]
+        return None
+
+    def _compute(self):
+        from . import stats as _stats
+        rows, label = self._scope_rows()
+        self.status.configure(text="Working…")
+
+        def work():
+            r = rows if rows is not None else [x for pst in self.app.files for x in pst.all_message_rows()]
+            files = ", ".join(f.name for f in self.app.files)
+            return r, _stats.compute(r, f"{files} - {label}", att_info=self._att_info)
+
+        def done(res):
+            try:
+                if isinstance(res, BaseException):
+                    self.status.configure(text=f"Could not compute: {res}")
+                    return
+                self.rows, self.stats = res
+                self._render()
+            except tk.TclError:
+                pass            # the window was closed while the numbers were being added up
+
+        self.app._run_bg(work, done)
+
+    def _render(self):
+        for tab in self.nb.tabs():
+            old = self.nametowidget(tab)
+            self.nb.forget(tab)
+            old.destroy()
+        for t in self.stats.tables:
+            frame = ttk.Frame(self.nb, padding=(6, 6))
+            self.nb.add(frame, text=t.title)
+            if t.note:
+                ttk.Label(frame, text=t.note, style="Dim.TLabel", wraplength=900).pack(side="top", anchor="w", pady=(0, 4))
+            cols = list(range(len(t.columns))) + ([len(t.columns)] if t.bar_column is not None else [])
+            tv = ttk.Treeview(frame, columns=[f"c{i}" for i in cols], show="headings")
+            biggest = 0.0
+            if t.bar_column is not None:
+                biggest = max((float(r[t.bar_column]) for r in t.rows if isinstance(r[t.bar_column], (int, float))), default=0.0)
+            for i in cols:
+                if i < len(t.columns):
+                    numeric = all(isinstance(r[i], (int, float)) for r in t.rows) if t.rows else False
+                    width = 110 if numeric else (360 if i == 0 or t.columns[i] in ("Subject", "Folder") else 200)
+                    tv.heading(f"c{i}", text=t.columns[i])
+                    tv.column(f"c{i}", width=width, anchor="e" if numeric else "w", stretch=not numeric)
+                else:
+                    tv.heading(f"c{i}", text="")
+                    tv.column(f"c{i}", width=220, anchor="w", stretch=False)
+            for r in t.rows:
+                vals = [f"{v:,}" if isinstance(v, int) else str(v) for v in r]
+                if t.bar_column is not None:
+                    v = r[t.bar_column]
+                    k = int(round(30 * float(v) / biggest)) if (biggest and isinstance(v, (int, float))) else 0
+                    vals.append("\u2588" * k)
+                tv.insert("", "end", values=vals)
+            sb = ttk.Scrollbar(frame, orient="vertical", command=tv.yview)
+            tv.configure(yscrollcommand=sb.set)
+            tv.pack(side="left", fill="both", expand=True)
+            sb.pack(side="right", fill="y")
+        self.status.configure(text=f"{self.stats.total:,} items - {self.stats.label}")
+
+    def _read_attachments(self):
+        """Open the messages that have attachments so the counts and sizes are real."""
+        todo = [r for r in self.rows if r.has_attachments and self._att_info(r) is None]
+        if not todo:
+            self.status.configure(text="Attachment details are already complete for this scope.")
+            return
+        self.att_btn.configure(state="disabled")
+        self.status.configure(text=f"Reading attachment lists of {len(todo):,} messages…")
+
+        def work():
+            for r in todo:
+                entry = self.app._details.setdefault(id(r), [r, None, None])
+                if entry[2] is not None:
+                    continue
+                try:
+                    entry[2] = [(a.filename, bool(a.hidden or a.is_inline), a.size or len(a.data or b""))
+                                for a in r.open().attachments()]
+                except Exception:  # noqa: BLE001
+                    entry[2] = []
+            return True
+
+        def done(_res):
+            try:
+                self.att_btn.configure(state="normal")
+                self._compute()
+            except tk.TclError:
+                pass
+
+        self.app._run_bg(work, done)
+
+    def _save_csv(self):
+        from . import stats as _stats
+        if self.stats is None:
+            return
+        d = filedialog.askdirectory(title="Save one CSV per table into", initialdir=default_save_dir(self.app.settings), parent=self)
+        if not d:
+            return
+        paths = _stats.write_csv_dir(self.stats, d)
+        self.status.configure(text=f"{len(paths)} CSV files written to {d}")
+
+    def _save_html(self):
+        from . import stats as _stats
+        if self.stats is None:
+            return
+        path = filedialog.asksaveasfilename(title="Save statistics as HTML", defaultextension=".html",
+                                            initialfile="mailbox-statistics.html", filetypes=[("Web page", "*.html")],
+                                            initialdir=default_save_dir(self.app.settings), parent=self)
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(_stats.render_html(self.stats))
+        self.status.configure(text=f"Saved {os.path.basename(path)}")
 
 
 class ProgressWindow(tk.Toplevel):
@@ -1264,6 +1783,6 @@ class ProgressWindow(tk.Toplevel):
 
 
 def launch(paths: Optional[List[str]] = None):
-    root = tk.Tk()
+    root = dnd.make_root()          # a TkinterDnD root when the package is there, plain Tk otherwise
     App(root, paths)
     root.mainloop()

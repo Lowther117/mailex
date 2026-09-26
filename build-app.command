@@ -111,6 +111,7 @@ rm -rf "$HERE/build" "$HERE/dist"
   --osx-bundle-identifier "uk.lowther.mailex" \
   --collect-all reportlab \
   --collect-all PIL \
+  --collect-all tkinterdnd2 \
   --collect-submodules mailexlib \
   --hidden-import tkinter \
   --hidden-import tkinter.ttk \

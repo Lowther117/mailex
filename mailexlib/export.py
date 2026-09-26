@@ -24,7 +24,9 @@ from email.utils import format_datetime, formataddr
 from urllib.parse import quote
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
+from . import contacts as _contacts
 from . import mapi, rtf
+from .filters import attachment_kind
 from .message import Attachment, Message, MessageRow
 from .ndb import PSTError
 
@@ -35,6 +37,7 @@ FORMATS = {
     "html": "HTML - one web page per message",
     "txt": "Plain text - one .txt per message",
     "attachments": "Attachments only - just the files that were attached",
+    "vcf": "Contacts (vCard + CSV) - one .vcf per contact, plus contacts.vcf and contacts.csv for importing",
 }
 
 _WIN_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
@@ -393,6 +396,10 @@ class ExportOptions:
     only_email: bool = False             # skip calendar/contact/task items
     write_index: bool = True             # index.csv + index.json at the export root
     embed_images: bool = True            # HTML: inline cid: images as data URIs
+    contacts_vcard: bool = True          # any format: contact items also get a .vcf, plus contacts.vcf/.csv at the root
+    attachment_extensions: Optional[set] = None   # attachments-only: keep just these extensions (lower-case, no dot)
+    attachment_types: Optional[set] = None        # attachments-only: keep just these kinds (documents/images/archives/other)
+    skip_inline_images: bool = False              # attachments-only: leave out inline / hidden pictures (signature logos)
 
 
 @dataclass
@@ -402,6 +409,7 @@ class ExportResult:
     failed: int = 0
     files_written: int = 0
     attachments_written: int = 0
+    contacts_written: int = 0
     errors: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
     index: List[dict] = field(default_factory=list)
@@ -412,6 +420,8 @@ class ExportResult:
         parts = [f"{self.exported} message{'s' if self.exported != 1 else ''} exported"]
         if self.attachments_written:
             parts.append(f"{self.attachments_written} attachments saved")
+        if self.contacts_written:
+            parts.append(f"{self.contacts_written} contact{'s' if self.contacts_written != 1 else ''} as vCard")
         if self.skipped:
             parts.append(f"{self.skipped} skipped")
         if self.failed:
@@ -434,6 +444,9 @@ class Exporter:
         self._taken: set = set()
         self._mboxes: Dict[str, mailbox.mbox] = {}
         self._pdf = None
+        self._cards: List[str] = []              # every vCard written, for the combined contacts.vcf
+        self._contact_rows: List[dict] = []      # and the rows of contacts.csv
+        self._name_map_noted: set = set()
 
     # -- paths ----------------------------------------------------------------
     def _target_dir(self, row: MessageRow, multi_file: bool, create: bool = True) -> str:
@@ -467,8 +480,10 @@ class Exporter:
                 label = row.subject or f"message 0x{row.nid:x}"
                 self.progress(i, total, label)
                 try:
-                    self._export_one(row, multi_file)
-                    self.result.exported += 1
+                    if self._export_one(row, multi_file) is False:
+                        self.result.skipped += 1
+                    else:
+                        self.result.exported += 1
                 except Exception as exc:  # noqa: BLE001 - one bad message must not stop the batch
                     self.result.failed += 1
                     self.result.errors.append(f"{row.folder.path_str} / {label}: {type(exc).__name__}: {exc}")
@@ -492,6 +507,11 @@ class Exporter:
             except Exception as exc:  # noqa: BLE001
                 self.result.errors.append(f"combined PDF: {exc}")
             self._pdf = None
+        if self._cards:
+            try:
+                self._write_contacts()
+            except Exception as exc:  # noqa: BLE001
+                self.result.errors.append(f"contacts.vcf / contacts.csv: {exc}")
         if self.o.write_index and self.result.index:
             try:
                 self._write_index()
@@ -518,6 +538,38 @@ class Exporter:
         with open(os.path.join(self.o.out_dir, "index.json"), "w", encoding="utf-8") as fh:
             json.dump(self.result.index, fh, indent=1, ensure_ascii=False, default=str)
 
+    def _write_contacts(self):
+        """Every contact of the run in one contacts.vcf (Apple Contacts, Outlook and
+        Google import that directly) and one contacts.csv, both at the export root."""
+        with open(os.path.join(self.o.out_dir, "contacts.vcf"), "w", encoding="utf-8", newline="") as fh:
+            fh.write(_contacts.combined_vcf(self._cards))
+        with open(os.path.join(self.o.out_dir, "contacts.csv"), "w", encoding="utf-8-sig", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=_contacts.CSV_COLUMNS, extrasaction="ignore")
+            w.writeheader()
+            for rec in self._contact_rows:
+                w.writerow(rec)
+        self.result.files_written += 2
+
+    def _write_contact(self, msg: Message, row: MessageRow, out_dir: str) -> str:
+        """One .vcf beside the message's other output; returns its path."""
+        c = _contacts.parse_contact(msg)
+        for w in c.warnings:
+            # one note per file is enough - every contact in it would say the same
+            key = (id(row.pst), w)
+            if key not in self._name_map_noted:
+                self._name_map_noted.add(key)
+                self.result.warnings.append(f"{row.pst.name}: {w}")
+        card = _contacts.vcard(c)
+        path = unique_path(os.path.join(out_dir, sanitize(c.name, 100) + ".vcf"), self._taken)
+        with open(fs_path(path), "w", encoding="utf-8", newline="") as fh:
+            fh.write(card)
+        self._cards.append(card)
+        self._contact_rows.append(_contacts.csv_row(c, row.pst.name, row.folder.path_str,
+                                                    os.path.relpath(path, self.o.out_dir)))
+        self.result.files_written += 1
+        self.result.contacts_written += 1
+        return path
+
     def _record(self, msg: Message, row: MessageRow, path: str):
         self.result.index.append({
             "file": row.pst.name,
@@ -537,11 +589,25 @@ class Exporter:
 
     # -- per message ----------------------------------------------------------
     def _export_one(self, row: MessageRow, multi_file: bool):
-        msg = row.open()
+        """Write one message. Returns False when the row was skipped on purpose
+        (a non-contact in a vCard export), anything else counts as exported."""
         fmt = self.o.fmt
+        contact = _contacts.is_contact_class(row.message_class)
+        if fmt == "vcf" and not contact:
+            return False
+        msg = row.open()
         needs_dir = not (fmt == "mbox" or (fmt == "pdf" and self.o.pdf_single_file and not self.o.include_attachments))
+        if contact and (fmt == "vcf" or self.o.contacts_vcard):
+            needs_dir = True
         out_dir = self._target_dir(row, multi_file, create=needs_dir)
         base = message_basename(msg, row)
+        if contact and _contacts.is_contact(msg) and (fmt == "vcf" or self.o.contacts_vcard):
+            vcf_path = self._write_contact(msg, row, out_dir)
+            if fmt == "vcf":
+                self._record(msg, row, vcf_path)
+                return True
+        elif fmt == "vcf":
+            return False          # a contact-classed item from a source that has no MAPI properties
         if fmt == "eml":
             path = unique_path(os.path.join(out_dir, base + ".eml"), self._taken)
             data = eml_bytes(msg, self.o.include_attachments)
@@ -611,9 +677,26 @@ class Exporter:
             raise ValueError(f"unknown format {fmt!r}")
         self._record(msg, row, path)
 
+    def _wanted_attachment(self, att) -> bool:
+        """The attachments-only filters: extension list, kind list, inline pictures."""
+        if self.o.fmt != "attachments":
+            return True
+        if self.o.skip_inline_images and not att.is_embedded_message and (att.hidden or att.is_inline):
+            return False
+        name = att.filename
+        if att.is_embedded_message and not name.lower().endswith(".eml"):
+            name += ".eml"
+        if self.o.attachment_extensions:
+            ext = os.path.splitext(name)[1].lstrip(".").lower()
+            if ext not in self.o.attachment_extensions:
+                return False
+        if self.o.attachment_types and attachment_kind(name) not in self.o.attachment_types:
+            return False
+        return True
+
     def _save_attachments(self, msg: Message, folder: str) -> Dict[int, str]:
         saved: Dict[int, str] = {}
-        atts = [a for a in msg.attachments()]
+        atts = [a for a in msg.attachments() if self._wanted_attachment(a)]
         if not atts:
             return saved
         made = False

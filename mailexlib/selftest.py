@@ -18,8 +18,11 @@ import traceback
 from email import policy as _policy
 from typing import List, Optional
 
-from . import mapi, rtf, synth
-from .export import ExportOptions, FORMATS, export, sanitize, unique_path
+from . import contacts as _contacts
+from . import mapi, rtf, stats as _stats, synth
+from . import namedprops as np
+from .export import ExportOptions, FORMATS, export, sanitize
+from .filters import RowFilter, attachment_kind, parse_date_bound, parse_extensions
 from .message import PSTFile
 from .ndb import CRYPT_CYCLIC, CRYPT_NONE, CRYPT_PERMUTE, decrypt_cyclic, decrypt_permute
 from .paths import APP, VERSION, app_dir
@@ -43,6 +46,45 @@ def _lzfu_compress_stored(rtf_bytes: bytes) -> bytes:
     """MELA (stored) form of compressed RTF - the reader must accept it."""
     import struct
     return struct.pack("<IIII", len(rtf_bytes) + 12, len(rtf_bytes), 0x414C454D, 0) + rtf_bytes
+
+
+LONG_NOTE = ("A note long enough to need folding at 75 octets, with naïve café ☕ and 日本語 in it so a multi-byte "
+             "character lands on a fold boundary somewhere; it repeats. ") * 4
+
+
+def build_contacts() -> List[synth.SynthMessage]:
+    """Two contact items: one with everything filled in, one nearly empty."""
+    A = np.PSETID_ADDRESS
+    modified = _dt.datetime(2023, 11, 20, 8, 0, tzinfo=_dt.timezone.utc)
+    U = mapi.PT_UNICODE
+    full = synth.SynthMessage("Ada Lovelace", "", "", [], modified, body=LONG_NOTE, message_class="IPM.Contact",
+                              extra={mapi.PR_DISPLAY_NAME: (U, "Ada Lovelace"), _contacts.PR_GIVEN_NAME: (U, "Ada"),
+                                     _contacts.PR_SURNAME: (U, "Lovelace"), _contacts.PR_NICKNAME: (U, "Countess"),
+                                     _contacts.PR_COMPANY_NAME: (U, "Analytical Engines, Ltd; London"),
+                                     _contacts.PR_TITLE: (U, "Mathematician"), _contacts.PR_DEPARTMENT_NAME: (U, "Research"),
+                                     _contacts.PR_BUSINESS_TELEPHONE_NUMBER: (U, "+44 20 7946 0000"),
+                                     _contacts.PR_HOME_TELEPHONE_NUMBER: (U, "+44 20 7946 0001"),
+                                     _contacts.PR_MOBILE_TELEPHONE_NUMBER: (U, "+44 7700 900123"),
+                                     _contacts.PR_BUSINESS_FAX_NUMBER: (U, "+44 20 7946 0002"),
+                                     _contacts.PR_BUSINESS_ADDRESS_STREET: (U, "1 Engine Row"),
+                                     _contacts.PR_BUSINESS_ADDRESS_CITY: (U, "London"),
+                                     _contacts.PR_BUSINESS_ADDRESS_POSTAL_CODE: (U, "W1A 1AA"),
+                                     _contacts.PR_BUSINESS_ADDRESS_COUNTRY: (U, "United Kingdom"),
+                                     _contacts.PR_HOME_ADDRESS_STREET: (U, "12 Ockham Park"),
+                                     _contacts.PR_HOME_ADDRESS_CITY: (U, "Surrey"),
+                                     _contacts.PR_POSTAL_ADDRESS: (U, "1 Engine Row\r\nLondon\r\nW1A 1AA"),
+                                     _contacts.PR_BIRTHDAY: (mapi.PT_SYSTIME, _dt.datetime(1815, 12, 10, tzinfo=_dt.timezone.utc)),
+                                     _contacts.PR_BUSINESS_HOME_PAGE: (U, "https://example.org/ada")},
+                              named={(A, np.LID_EMAIL1_EMAIL_ADDRESS): (U, "ada@example.org"),
+                                     (A, np.LID_EMAIL1_DISPLAY_NAME): (U, "Ada Lovelace (ada@example.org)"),
+                                     (A, np.LID_EMAIL2_EMAIL_ADDRESS): (U, "countess@example.net"),
+                                     (A, np.LID_FILE_UNDER): (U, "Lovelace, Ada"),
+                                     (A, np.LID_IM_ADDRESS): (U, "ada@chat.example.org"),
+                                     (np.PS_PUBLIC_STRINGS, "Keywords"): (mapi.PT_MV_FLAG | U, ["Science", "VIP"])})
+    sparse = synth.SynthMessage("Bob Example", "", "", [], modified + _dt.timedelta(hours=1), message_class="IPM.Contact",
+                                extra={mapi.PR_DISPLAY_NAME: (U, "Bob Example")},
+                                named={(A, np.LID_EMAIL1_EMAIL_ADDRESS): (U, "bob@example.com")})
+    return [full, sparse]
 
 
 def build_mailbox() -> List[synth.SynthFolder]:
@@ -90,6 +132,7 @@ def build_mailbox() -> List[synth.SynthFolder]:
         synth.SynthFolder("Sent Items", [synth.SynthMessage("Sent one", "Bob Example", "bob@example.com",
                                                              [("Alice Example", "alice@example.com")], when, body="Sent body.")]),
         synth.SynthFolder("Bulk", many),
+        synth.SynthFolder("Contacts", build_contacts(), container_class="IPM.Contact"),
         synth.SynthFolder("Empty"),
     ])]
 
@@ -118,6 +161,7 @@ def run(verbose: bool = True, extra_files: Optional[List[str]] = None) -> int:
         record("HTML to text", rtf.html_to_text("<p>One&nbsp;two</p><br><div>three</div>") == "One two\n\nthree",
                repr(rtf.html_to_text("<p>One&nbsp;two</p><br><div>three</div>")))
         record("filename sanitising", sanitize('a<b>:"c/d\\e|f?g*h  .') == "a_b___c_d_e_f_g_h" and sanitize("CON") == "_CON")
+        _check_units(record)
 
         # ---- synthetic files, one per encryption mode
         mailbox = build_mailbox()
@@ -177,6 +221,106 @@ def run(verbose: bool = True, extra_files: Optional[List[str]] = None) -> int:
     return 0 if not failed else 1
 
 
+class _FakeRow:
+    """Just enough of a listing row for the filter checks."""
+
+    def __init__(self, subject="", sender="", to="", date=None, size=0, has_attachments=False,
+                 message_class="IPM.Note", read=True):
+        self.subject, self.sender, self.to, self.date, self.size = subject, sender, to, date, size
+        self.has_attachments, self.message_class, self.read = has_attachments, message_class, read
+
+
+def _check_units(record):
+    # ---- date bounds (local time, like the list)
+    utc = _dt.timezone.utc
+    a = parse_date_bound("2019")
+    b = parse_date_bound("2019", end=True)
+    c = parse_date_bound("2019-03")
+    d = parse_date_bound("2019-03", end=True)
+    e = parse_date_bound("2019-03-15")
+    f = parse_date_bound("2019-03-15", end=True)
+    ok = (a is not None and b is not None and a.tzinfo is not None
+          and (a.year, a.month, a.day, a.hour) == (2019, 1, 1, 0)
+          and (b.year, b.month, b.day, b.hour, b.minute, b.second) == (2019, 12, 31, 23, 59, 59)
+          and (c.month, c.day) == (3, 1) and (d.month, d.day, d.hour) == (3, 31, 23)
+          and (e.day, e.hour) == (15, 0) and (f.day, f.hour, f.minute) == (15, 23, 59)
+          and parse_date_bound("2019-12", end=True).month == 12 and parse_date_bound("2020-02", end=True).day == 29
+          and parse_date_bound("") is None and parse_date_bound("   ") is None and parse_date_bound("last week") is None
+          and parse_date_bound("2019-13") is None and parse_date_bound("2019-02-30") is None
+          and parse_date_bound("2019/03/15") == e and parse_date_bound(" 2019-3-5 ").day == 5)
+    record("date bound parsing", ok, f"{a} .. {b}; {c} .. {d}; {e} .. {f}")
+
+    # ---- the row filter
+    mar = _dt.datetime(2019, 3, 15, 12, 0, tzinfo=utc)
+    rows = [_FakeRow("Invoice 42", "Alice <alice@example.com>", "bob", mar, 100, True),
+            _FakeRow("Holiday photos", "Carol", "bob", _dt.datetime(2020, 7, 1, tzinfo=utc), 500, True),
+            _FakeRow("No date at all", "Dave", "bob", None, 10),
+            _FakeRow("Ada Lovelace", "", "", _dt.datetime(2018, 1, 1, tzinfo=utc), 5, False, "IPM.Contact"),
+            _FakeRow("Meeting", "Erin", "bob", mar, 5, False, "IPM.Appointment")]
+    bodies = {"Invoice 42": "please find the pdf attached", "Holiday photos": "beach", "No date at all": "invoice inside"}
+    atts = {"Invoice 42": [("invoice.pdf", False), ("logo.png", True)], "Holiday photos": [("IMG_1.jpg", False)]}
+    body_fn = lambda r: bodies.get(r.subject)          # noqa: E731
+    att_fn = lambda r: atts.get(r.subject, [])         # noqa: E731
+    subj = lambda rs: [r.subject for r in rs]           # noqa: E731
+    checks = [
+        ("no filter", subj(RowFilter().apply(rows)), subj(rows)),
+        ("text", subj(RowFilter(text="invoice").apply(rows)), ["Invoice 42"]),
+        ("text in body", subj(RowFilter(text="invoice", search_body=True).apply(rows, body=body_fn)), ["Invoice 42", "No date at all"]),
+        ("body not yet known", subj(RowFilter(text="beach", search_body=True).apply(rows, body=lambda r: None)), []),
+        ("two words split across subject and body", subj(RowFilter(text="invoice pdf", search_body=True).apply(rows, body=body_fn)), ["Invoice 42"]),
+        ("since", subj(RowFilter(since=parse_date_bound("2019-03-15")).apply(rows)), ["Invoice 42", "Holiday photos", "Meeting"]),
+        ("until", subj(RowFilter(until=parse_date_bound("2019", end=True)).apply(rows)), ["Invoice 42", "Ada Lovelace", "Meeting"]),
+        ("since and until", subj(RowFilter(since=parse_date_bound("2019-03"), until=parse_date_bound("2019-03", end=True)).apply(rows)), ["Invoice 42", "Meeting"]),
+        ("undated kept only without bounds", subj(RowFilter(text="date").apply(rows)), ["No date at all"]),
+        ("has attachments", subj(RowFilter(has_attachments=True).apply(rows)), ["Invoice 42", "Holiday photos"]),
+        ("documents", subj(RowFilter(attachment_type="documents").apply(rows, atts=att_fn)), ["Invoice 42"]),
+        ("images ignore inline", subj(RowFilter(attachment_type="images").apply(rows, atts=att_fn)), ["Holiday photos"]),
+        ("attachment names not yet known", subj(RowFilter(attachment_type="images").apply(rows, atts=lambda r: None)), []),
+        ("contacts", subj(RowFilter(contacts_only=True).apply(rows)), ["Ada Lovelace"]),
+        ("e-mail only", subj(RowFilter(only_mail=True).apply(rows)), ["Invoice 42", "Holiday photos", "No date at all"]),
+    ]
+    bad = [f"{name}: got {got}" for name, got, want in checks if got != want]
+    record("row filter", not bad, "; ".join(bad) if bad else f"{len(checks)} cases")
+    flt = RowFilter(text="x", search_body=True, since=parse_date_bound("2019"), has_attachments=True, attachment_type="images")
+    record("row filter flags", flt.active and flt.needs_body and flt.needs_attachment_names and not RowFilter().active
+           and "in bodies too" in flt.describe() and "images" in flt.describe(), flt.describe())
+    record("attachment kinds", [attachment_kind(x) for x in ("a.PDF", "b.docx", "c.jpeg", "d.tar.gz", "e.exe", "f")]
+           == ["documents", "documents", "images", "archives", "other", "other"]
+           and parse_extensions("pdf, .DOCX xlsx;zip") == {"pdf", "docx", "xlsx", "zip"})
+
+    # ---- vCard escaping and folding
+    esc = _contacts.vcard_escape("a,b;c\\d\r\ne")
+    long_line = "NOTE:" + "naïve café ☕ 日本語 " * 12
+    folded = _contacts.fold_line(long_line)
+    lines = folded.split("\r\n")
+    ok = (esc == "a\\,b\\;c\\\\d\\ne" and len(lines) > 1 and all(len(x.encode("utf-8")) <= 75 for x in lines)
+          and all(x.startswith(" ") for x in lines[1:])
+          and "".join([lines[0]] + [x[1:] for x in lines[1:]]) == long_line
+          and _contacts.fold_line("short") == "short")
+    record("vCard escaping and 75-octet folding", ok, f"{len(lines)} lines, longest {max(len(x.encode('utf-8')) for x in lines)} octets")
+    c = _contacts.Contact(display_name="Zoë, Jr; Test", given="Zoë", surname="Test", company="A, B; C",
+                          emails=[("", "z@example.com")], phones=[("cell", "+1 555")], notes="line1\nline2")
+    card = _contacts.vcard(c)
+    ok = (card.startswith("BEGIN:VCARD\r\nVERSION:3.0") and card.endswith("END:VCARD\r\n")
+          and "FN:Zoë\\, Jr\\; Test" in card and "N:Test;Zoë;;;" in card and "ORG:A\\, B\\; C" in card
+          and "EMAIL;TYPE=INTERNET,PREF:z@example.com" in card and "TEL;TYPE=CELL,PREF:+1 555" in card
+          and "NOTE:line1\\nline2" in card)
+    record("vCard fields", ok, card.replace("\r\n", " | ")[:160])
+    row = _contacts.csv_row(c, "f.pst", "Contacts")
+    record("contact CSV row", row["display_name"] == "Zoë, Jr; Test" and row["email1"] == "z@example.com"
+           and row["mobile_phone"] == "+1 555" and list(row) == _contacts.CSV_COLUMNS)
+
+    # ---- the name-to-id map parser on hand-built streams (string names, GUID index, bad entries)
+    g, en, st = np.build_streams([(np.PSETID_ADDRESS, 0x8083), (np.PS_PUBLIC_STRINGS, "Keywords"), (np.PSETID_COMMON, 0x8503)])
+    nm = np.NameMap.from_streams(g, en + b"\x01\x00\x00\x00\xfe\x00\x09\x00", st)   # plus one entry with an absent GUID
+    ok = (nm.lookup(np.PSETID_ADDRESS, 0x8083) == 0x8000 and nm.lookup(np.PS_PUBLIC_STRINGS, "keywords") == 0x8001
+          and nm.lookup(np.PS_PUBLIC_STRINGS, "KEYWORDS") == 0x8001 and nm.lookup(np.PSETID_COMMON, 0x8503) == 0x8002
+          and nm.lookup(np.PSETID_COMMON, 0x9999) is None and nm.name_of(0x8000) == "PidLidEmail1EmailAddress"
+          and nm.name_of(0x8002) == "PidLidReminderSet" and nm.name_of(0x8009) is None and nm.ok)
+    record("name-to-id map parsing", ok, f"{len(nm)} entries")
+    empty = np.NameMap.from_streams(None, None, None)
+    record("missing name map degrades", not empty.ok and empty.lookup(np.PSETID_ADDRESS, 0x8083) is None and len(empty) == 0)
+
 def _check_synthetic(path: str, label: str, record, tmp: str):
     pst = PSTFile(path)
     try:
@@ -219,9 +363,34 @@ def _check_synthetic(path: str, label: str, record, tmp: str):
         record(f"embedded message ({label})", emb is not None and emb.subject == "Forwarded original"
                and emb.body_text == "This is the embedded message body." and emb.sender_email == "orig@example.org")
 
+        # ---- contacts and the named properties behind their e-mail addresses
+        nm = pst.name_map()
+        record(f"PST name-to-id map ({label})", nm.ok and len(nm) == len(synth.NAMED_PST)
+               and nm.lookup(np.PSETID_ADDRESS, np.LID_EMAIL1_EMAIL_ADDRESS) == 0x8000, nm.error or f"{len(nm)} entries")
+        crows = folders["Contacts"].messages()
+        cmsgs = {r.subject: r.open() for r in crows}
+        ada = cmsgs.get("Ada Lovelace")
+        card = _contacts.parse_contact(ada) if ada is not None else None
+        ok = (len(crows) == 2 and all(_contacts.is_contact_class(r.message_class) for r in crows) and card is not None
+              and card.emails == [("", "ada@example.org"), ("", "countess@example.net")] and card.file_under == "Lovelace, Ada"
+              and card.im_address == "ada@chat.example.org" and card.categories == ["Science", "VIP"]
+              and card.company == "Analytical Engines, Ltd; London" and card.business.postcode == "W1A 1AA"
+              and card.home.street == "12 Ockham Park" and card.birthday.year == 1815 and card.notes == LONG_NOTE.strip()
+              and [k for k, _v in card.phones] == ["work", "home", "cell", "work,fax"] and not card.warnings)
+        record(f"contact named properties ({label})", ok, f"emails={card.emails if card else None}")
+        names = {name for _pid, name, _t, _v in ada.all_properties()} if ada is not None else set()
+        record(f"inspector shows named property names ({label})",
+               {"PidLidEmail1EmailAddress", "PidLidFileUnder", "PidNameKeywords (Categories)", "GivenName"} <= names,
+               ", ".join(sorted(n for n in names if n.startswith("Pid"))))
+        sparse = cmsgs.get("Bob Example")
+        sc = _contacts.parse_contact(sparse) if sparse is not None else None
+        record(f"sparse contact ({label})", sc is not None and sc.email == "bob@example.com" and sc.name == "Bob Example"
+               and "EMAIL;TYPE=INTERNET,PREF:bob@example.com" in _contacts.vcard(sc))
+
         # ---- exports
         out_root = os.path.join(tmp, f"export-{label}")
         all_rows = list(pst.all_message_rows())
+        n_contacts = 2
         for fmt in FORMATS:
             out = os.path.join(out_root, fmt)
             res = export(all_rows, ExportOptions(fmt=fmt, out_dir=out, pdf_single_file=False))
@@ -285,13 +454,56 @@ def _check_synthetic(path: str, label: str, record, tmp: str):
                 files = [f for f in glob.glob(os.path.join(out, "**", "*"), recursive=True) if os.path.isfile(f)]
                 names = {os.path.basename(f) for f in files}
                 ok = ok and {"picture.png", "big file.bin", "notes.txt", "Forwarded original.eml"} <= names
+            elif fmt == "vcf":
+                vcfs = glob.glob(os.path.join(out, "**", "*.vcf"), recursive=True)
+                singles = [f for f in vcfs if os.path.basename(f) != "contacts.vcf"]
+                combined = os.path.join(out, "contacts.vcf")
+                ccsv = os.path.join(out, "contacts.csv")
+                ok = (res.exported == n_contacts and res.skipped == len(all_rows) - n_contacts and res.contacts_written == n_contacts
+                      and len(singles) == n_contacts and os.path.isfile(combined) and os.path.isfile(ccsv))
+                if ok:
+                    text = open(combined, encoding="utf-8", newline="").read()
+                    ok = text.count("BEGIN:VCARD") == n_contacts and "EMAIL;TYPE=INTERNET,PREF:ada@example.org" in text \
+                        and "\r\n" in text and "ORG:Analytical Engines\\, Ltd\\; London;Research" in text
+                    import csv as _csv
+                    with open(ccsv, encoding="utf-8-sig", newline="") as fh:
+                        recs = list(_csv.DictReader(fh))
+                    ok = ok and len(recs) == n_contacts and {r["email1"] for r in recs} == {"ada@example.org", "bob@example.com"} \
+                        and any(r["email2"] == "countess@example.net" and r["categories"] == "Science; VIP" for r in recs)
+                detail += f"; {len(singles)} cards"
+            if fmt == "vcf":
+                continue          # vCard exports carry no index of messages beyond their own files
             idx = os.path.join(out, "index.csv")
             ok = ok and os.path.isfile(idx) and os.path.isfile(os.path.join(out, "index.json"))
+            if fmt in ("eml", "txt"):
+                # contacts get a .vcf beside their normal output, plus the two combined files at the top
+                vcfs = glob.glob(os.path.join(out, "**", "*.vcf"), recursive=True)
+                ok = ok and len(vcfs) == n_contacts + 1 and os.path.isfile(os.path.join(out, "contacts.csv")) \
+                    and res.contacts_written == n_contacts
+                detail += f"; {len(vcfs)} vcf files alongside"
             record(f"export {fmt} ({label})", ok, detail)
+        res = export(all_rows, ExportOptions(fmt="eml", out_dir=os.path.join(out_root, "novcf"), contacts_vcard=False,
+                                              include_attachments=False, write_index=False))
+        record(f"contacts as vCard can be switched off ({label})", res.contacts_written == 0 and res.exported == len(all_rows)
+               and not glob.glob(os.path.join(out_root, "novcf", "**", "*.vcf"), recursive=True))
+        # attachments-only filters: extensions, kinds, inline pictures
+        res = export(all_rows, ExportOptions(fmt="attachments", out_dir=os.path.join(out_root, "att-ext"),
+                                              attachment_extensions={"bin"}, contacts_vcard=False, write_index=False))
+        names = {os.path.basename(f) for f in glob.glob(os.path.join(out_root, "att-ext", "**", "*"), recursive=True) if os.path.isfile(f)}
+        ok = names == {"big file.bin"}
+        res = export(all_rows, ExportOptions(fmt="attachments", out_dir=os.path.join(out_root, "att-kind"),
+                                              attachment_types={"documents"}, contacts_vcard=False, write_index=False))
+        names2 = {os.path.basename(f) for f in glob.glob(os.path.join(out_root, "att-kind", "**", "*"), recursive=True) if os.path.isfile(f)}
+        ok = ok and names2 == {"notes.txt"}
+        res = export(all_rows, ExportOptions(fmt="attachments", out_dir=os.path.join(out_root, "att-noinline"),
+                                              skip_inline_images=True, contacts_vcard=False, write_index=False))
+        names3 = {os.path.basename(f) for f in glob.glob(os.path.join(out_root, "att-noinline", "**", "*"), recursive=True) if os.path.isfile(f)}
+        ok = ok and "picture.png" not in names3 and {"big file.bin", "notes.txt", "Forwarded original.eml"} <= names3
+        record(f"attachments-only filters ({label})", ok, f"{sorted(names)} {sorted(names2)} {sorted(names3)}")
         # only-email filter and cancellation
         res = export(all_rows, ExportOptions(fmt="txt", out_dir=os.path.join(out_root, "mailonly"), only_email=True,
                                               include_attachments=False))
-        record(f"e-mail-only filter ({label})", res.exported == len(all_rows) - 1, res.summary())
+        record(f"e-mail-only filter ({label})", res.exported == len(all_rows) - 1 - n_contacts, res.summary())
         import threading
         ev = threading.Event()
         ev.set()
@@ -451,6 +663,41 @@ def _check_sources(record, tmp: str, mailbox_def):
     ok = ok and emb is not None and emb.subject == "Forwarded original" and emb.body_text == "This is the embedded message body."
     record("Outlook .msg files (compound file reader)", ok, f"{len(rows)} files")
 
+    # -- .msg contacts: the same cards through a name-to-id map numbered the other way round
+    cmsg_dir = os.path.join(base, "msg-contacts")
+    os.makedirs(cmsg_dir)
+    for i, m in enumerate(build_contacts()):
+        synth.write_msg(os.path.join(cmsg_dir, f"contact{i}.msg"), m)
+    src = FilesSource(cmsg_dir)
+    crows = list(src.all_message_rows())
+    cm = {r.subject: r.open() for r in crows}
+    ada = cm.get("Ada Lovelace")
+    nm = ada.name_map() if ada is not None else None
+    card = _contacts.parse_contact(ada) if ada is not None else None
+    pst_card = _contacts.parse_contact(next(r for r in seed_rows if r.subject == "Ada Lovelace").open())
+    ok = (nm is not None and nm.ok and nm.lookup(np.PSETID_ADDRESS, np.LID_EMAIL1_EMAIL_ADDRESS) != 0x8000
+          and card is not None and card.emails == [("", "ada@example.org"), ("", "countess@example.net")]
+          and card.categories == ["Science", "VIP"] and card.file_under == "Lovelace, Ada"
+          and all(_contacts.is_contact_class(r.message_class) for r in crows)
+          and _contacts.csv_row(card) == _contacts.csv_row(pst_card))
+    record(".msg contacts via named properties", ok, f"Email1 tag 0x{nm.lookup(np.PSETID_ADDRESS, 0x8083) or 0:04X}" if nm else "no map")
+    out_v = os.path.join(base, "msg-vcf")
+    res = export(crows, ExportOptions(fmt="vcf", out_dir=out_v))
+    record(".msg contacts export as vCard", res.exported == 2 and os.path.isfile(os.path.join(out_v, "contacts.vcf"))
+           and "ada@example.org" in open(os.path.join(out_v, "contacts.vcf"), encoding="utf-8").read(), res.summary())
+    # a .msg with no name map still exports, minus the address, and says so
+    plain = synth.SynthMessage("Nameless", "", "", [], _dt.datetime(2024, 1, 1, tzinfo=_dt.timezone.utc),
+                               message_class="IPM.Contact", extra={mapi.PR_DISPLAY_NAME: (mapi.PT_UNICODE, "Nameless")})
+    root = synth._Node("Root Entry")
+    synth.build_msg_tree(plain, root, embedded=True)          # embedded=True: no name-to-id streams get written
+    synth.write_compound_file(os.path.join(cmsg_dir, "nomap.msg"), root)
+    nrow = [r for r in FilesSource(cmsg_dir).all_message_rows() if r.subject == "Nameless"]
+    res = export(nrow, ExportOptions(fmt="vcf", out_dir=os.path.join(base, "nomap-vcf")))
+    record("contact without a name map degrades", res.exported == 1 and not res.errors and res.warnings
+           and any("e-mail addresses could not be read" in w for w in res.warnings)
+           and os.path.isfile(os.path.join(base, "nomap-vcf", "export-log.txt")),
+           res.warnings[0] if res.warnings else res.summary())
+
     # -- the layouts real machines have
     live = os.path.join(base, "applelive", "Inbox.mbox", "0A1B2C3D-0000-4000-8000-000000000001", "Data", "1", "Messages")
     os.makedirs(live)
@@ -566,4 +813,101 @@ def _check_sources(record, tmp: str, mailbox_def):
                res.summary() + f" from {len(srcs)} sources" + ("; " + res.errors[0] if res.errors else ""))
     for s_ in srcs:
         s_.close()
+
+    # -- what a drag out of the list would hand to Finder / Explorer
+    from . import dnd
+    folder = dnd.DragFolder()
+    try:
+        pick = [r for r in seed_rows if r.subject in ("Plain text message", "Ada Lovelace")]
+        pick += [r for r in seed_rows if r.subject == "Bulk message 000"]      # Project X and Bulk both have one
+        paths = dnd.export_for_drag(pick, folder)
+        names = sorted(os.path.basename(p) for p in paths)
+        ok = (len(paths) == 4 and all(os.path.isfile(p) and folder.contains(p) for p in paths)
+              and sum(1 for n in names if n.endswith(".vcf")) == 1 and sum(1 for n in names if n.endswith(".eml")) == 3
+              and any(n.endswith(" Bulk message 000-2.eml") for n in names)
+              and "BEGIN:VCARD" in open([p for p in paths if p.endswith(".vcf")][0], encoding="utf-8").read())
+        record("drag-out files (.eml / .vcf, de-duplicated)", ok, ", ".join(names))
+        record("drag and drop degrades without tkinterdnd2", dnd.available() or (not dnd.enable_drag_out(None, list, folder, print)
+                                                                                 and not dnd.enable_drop_in([], print)))
+    finally:
+        drag_dir = folder._dir
+        folder.cleanup()
+    record("drag folder is removed on cleanup", bool(drag_dir) and not os.path.isdir(drag_dir) and folder._dir is None)
+
+    # -- statistics over the seed rows
+    st = _stats.compute(seed_rows, "seed", att_info=lambda r: [(a.filename, a.size) for a in r.open().attachments()])
+    years = {r[0]: r[1] for r in st.get("years").rows}
+    months = {r[0]: r[1] for r in st.get("months").rows}
+    senders = {r[0]: r[1] for r in st.get("senders").rows}
+    domains = {r[0]: r[1] for r in st.get("domains").rows}
+    folders = {r[0].rsplit("/", 1)[-1]: r[1] for r in st.get("folders").rows}
+    att = {r[0]: r[1] for r in st.get("attachments").rows}
+    largest = st.get("largest").rows
+    ov = {r[0]: r[1] for r in st.get("overview").rows}
+    ok = (years == {"2024": n_all - 2, "2023": 2} and months.get("2024-03") == n_all - 2 and months.get("2023-11") == 2
+          and senders.get("Sender 0") == 34 and len(st.get("senders").rows) == 10
+          and domains.get("example.com") == n_all - 3 and "Inbox" in folders and folders["Bulk"] == 230
+          and att["Messages with attachments"] == "3" and att["Attachments counted"] == "4"
+          and largest[0][2] == "Long body and a big attachment" and ov["Read / unread"] == f"{n_all - 1:,} / 1"
+          and ov["Items: contact"] == "2" and ov["Items: appointment / meeting"] == "1")
+    record("statistics tables", ok, f"years={years} senders={len(senders)} domains={domains} att={att}")
+    txt = _stats.render_text(st)
+    html = _stats.render_html(st)
+    csvs = _stats.write_csv_dir(st, os.path.join(base, "stats-csv"))
+    record("statistics rendering", "Messages per year" in txt and "2024" in txt and "#" in txt and "<table>" in html
+           and "Sender 0" in html and len(csvs) == len(st.tables) and all(os.path.isfile(c) for c in csvs)
+           and open(csvs[1], encoding="utf-8-sig").read().startswith("Year,Messages,Size"), f"{len(csvs)} csv files")
+
+    # -- the command line: filters, formats and stats
+    import contextlib
+    import io
+    from .cli import main as cli_main
+
+    def run_cli(*args):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            rc = cli_main(list(args))
+        return rc, buf.getvalue()
+
+    def exported_count(text):
+        import re as _re
+        m = _re.search(r"^(\d+) messages? exported", text, _re.M)
+        return int(m.group(1)) if m else -1
+
+    cli_out = os.path.join(base, "cli")
+    cases = [
+        ("since/until day", ["--since", "2024-03-05", "--until", "2024-03-05"], n_all - 2),
+        ("until year", ["--until", "2023"], 2),
+        ("since month", ["--since", "2024-04"], 0),
+        ("search subject", ["--search", "bulk 22"], 12),
+        ("search body", ["--search", "attached message", "--search-body"], 1),
+        ("search without body", ["--search", "attached message"], 0),
+        ("has attachments", ["--has-attachments"], 3),
+        ("attachment type documents", ["--attachment-type", "documents"], 1),
+        ("attachment type images (inline ignored)", ["--attachment-type", "images"], 0),
+        ("email only", ["--email-only"], n_all - 3),
+    ]
+    bad = []
+    for i, (name, flags, want) in enumerate(cases):
+        rc, out = run_cli("export", pst_path, "-o", os.path.join(cli_out, f"c{i}"), "-f", "txt", "--no-attachments", *flags)
+        got = exported_count(out)
+        if got != want or rc != 0:
+            bad.append(f"{name}: {got} (rc {rc})")
+    record("CLI export filters", not bad, "; ".join(bad) if bad else f"{len(cases)} cases")
+    rc, out = run_cli("export", pst_path, "-o", os.path.join(cli_out, "vcf"), "-f", "vcf")
+    record("CLI vCard export", rc == 0 and exported_count(out) == 2 and os.path.isfile(os.path.join(cli_out, "vcf", "contacts.csv")), out.strip().splitlines()[-1] if out.strip() else "")
+    rc, out = run_cli("export", pst_path, "-o", os.path.join(cli_out, "attx"), "-f", "attachments", "--att-ext", "bin,txt",
+                      "--skip-inline-images", "--flat")
+    files = {os.path.basename(f) for f in glob.glob(os.path.join(cli_out, "attx", "**", "*"), recursive=True) if os.path.isfile(f)}
+    record("CLI attachment filters", rc == 0 and {"big file.bin", "notes.txt"} <= files and "picture.png" not in files
+           and "Forwarded original.eml" not in files, str(sorted(files)))
+    rc, out = run_cli("export", pst_path, "-o", os.path.join(cli_out, "baddate"), "--since", "yesterday")
+    record("CLI rejects a date it cannot read", rc == 2)
+    rc, out = run_cli("stats", pst_path, "--csv", os.path.join(cli_out, "stats"), "--html", os.path.join(cli_out, "stats.html"))
+    record("CLI stats", rc == 0 and "Messages per year" in out and "Sender 0" in out and "Attachments counted" in out
+           and os.path.isfile(os.path.join(cli_out, "stats.html")) and len(glob.glob(os.path.join(cli_out, "stats", "*.csv"))) == 9,
+           f"{len(out.splitlines())} lines of text")
+    rc, out = run_cli("--help")
+    record("CLI help mentions the new options", rc == 0 and "--search-body" in out and "--since" in out and "stats" in out
+           and "vcf" in out and "PST or OST" not in out)
     pst.close()

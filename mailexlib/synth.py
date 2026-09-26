@@ -16,11 +16,22 @@ import struct
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import mapi
+from . import namedprops as np
 from ._crypt_tables import CYCLIC_R, CYCLIC_S, PERMUTE
-from .ndb import CRYPT_CYCLIC, CRYPT_NONE, CRYPT_PERMUTE
+from .ndb import CRYPT_CYCLIC, CRYPT_NONE, CRYPT_PERMUTE, NID_NAME_TO_ID_MAP
 
 MAX_BLOCK_DATA = 8176      # 8192 - 16 byte trailer
 HEAP_ITEM_LIMIT = 3400     # bigger values go to a sub-node, like Outlook does
+
+# The named properties the synthetic files know about, in name-to-id-map order
+# (index i is property 0x8000 + i). The .msg writer uses the reverse order on
+# purpose: a reader that assumed Outlook's usual numbering instead of reading
+# the map would get the PST right and the .msg wrong.
+NAMED_PST = [(np.PSETID_ADDRESS, np.LID_EMAIL1_EMAIL_ADDRESS), (np.PSETID_ADDRESS, np.LID_EMAIL1_DISPLAY_NAME),
+             (np.PSETID_ADDRESS, np.LID_FILE_UNDER), (np.PS_PUBLIC_STRINGS, "Keywords"),
+             (np.PSETID_ADDRESS, np.LID_IM_ADDRESS), (np.PSETID_ADDRESS, np.LID_EMAIL2_EMAIL_ADDRESS),
+             (np.PSETID_APPOINTMENT, 0x8208)]
+NAMED_MSG = list(reversed(NAMED_PST))
 
 _INV_PERMUTE = bytes(PERMUTE.index(i) for i in range(256))
 _INV_R = bytes(CYCLIC_R.index(i) for i in range(256))
@@ -415,6 +426,7 @@ FOLDER_COLS = [(mapi.PR_DISPLAY_NAME, mapi.PT_UNICODE), (mapi.PR_CONTENT_COUNT, 
                (mapi.PR_CONTENT_UNREAD, mapi.PT_LONG), (mapi.PR_SUBFOLDERS, mapi.PT_BOOLEAN),
                (mapi.PR_CONTAINER_CLASS, mapi.PT_UNICODE)]
 MSG_COLS = [(mapi.PR_SUBJECT, mapi.PT_UNICODE), (mapi.PR_SENDER_NAME, mapi.PT_UNICODE),
+            (mapi.PR_SENDER_EMAIL, mapi.PT_UNICODE),
             (mapi.PR_MESSAGE_DELIVERY_TIME, mapi.PT_SYSTIME), (mapi.PR_MESSAGE_SIZE, mapi.PT_LONG),
             (mapi.PR_HASATTACH, mapi.PT_BOOLEAN), (mapi.PR_MESSAGE_CLASS, mapi.PT_UNICODE),
             (mapi.PR_DISPLAY_TO, mapi.PT_UNICODE), (mapi.PR_MESSAGE_FLAGS, mapi.PT_LONG),
@@ -432,7 +444,8 @@ class SynthMessage:
                  attachments: Optional[List[tuple]] = None,
                  embedded: Optional["SynthMessage"] = None, message_class: str = "IPM.Note",
                  read: bool = True, extra: Optional[Dict[int, Tuple[int, object]]] = None,
-                 cc: Optional[List[Tuple[str, str]]] = None, headers: str = ""):
+                 cc: Optional[List[Tuple[str, str]]] = None, headers: str = "",
+                 named: Optional[Dict[tuple, Tuple[int, object]]] = None):
         self.subject = subject
         self.sender = sender
         self.sender_email = sender_email
@@ -448,6 +461,18 @@ class SynthMessage:
         self.read = read
         self.extra = extra or {}
         self.headers = headers
+        self.named = named or {}          # (property set GUID, id or name) -> (ptype, value)
+
+
+def _named_props(m: SynthMessage, order: List[tuple]) -> Dict[int, Tuple[int, object]]:
+    """The message's named properties as real property ids, per the file's map."""
+    out: Dict[int, Tuple[int, object]] = {}
+    for key, (ptype, value) in m.named.items():
+        guid, ident = key
+        norm = (guid, ident.lower() if isinstance(ident, str) else ident)
+        idx = next(i for i, (g, n) in enumerate(order) if (g, n.lower() if isinstance(n, str) else n) == norm)
+        out[0x8000 + idx] = (ptype, value)
+    return out
 
 
 def _write_message(w: PSTWriter, m: SynthMessage, nid: int, parent_nid: int, embedded: bool = False) -> Tuple[int, int]:
@@ -481,6 +506,7 @@ def _write_message(w: PSTWriter, m: SynthMessage, nid: int, parent_nid: int, emb
     if m.headers:
         props[mapi.PR_TRANSPORT_HEADERS] = (mapi.PT_UNICODE, m.headers)
     props.update(m.extra)
+    props.update(_named_props(m, NAMED_PST))
     # recipients
     rrows = []
     for i, (name, addr) in enumerate([(n, a) for n, a in m.to] + [(n, a) for n, a in m.cc]):
@@ -590,7 +616,7 @@ def write_pst(path: str, root_folders: List[SynthFolder], store_name: str = "Syn
             next_msg[0] += 0x20
             _write_message(w, m, mnid, nid)
             msg_rows.append({mapi.PR_LTP_ROW_ID: mnid, mapi.PR_SUBJECT: m.subject, mapi.PR_SENDER_NAME: m.sender,
-                             mapi.PR_MESSAGE_DELIVERY_TIME: m.date, mapi.PR_MESSAGE_SIZE: len(m.body) + 500,
+                             mapi.PR_SENDER_EMAIL: m.sender_email, mapi.PR_MESSAGE_DELIVERY_TIME: m.date, mapi.PR_MESSAGE_SIZE: len(m.body) + 500,
                              mapi.PR_HASATTACH: bool(m.attachments or m.embedded), mapi.PR_MESSAGE_CLASS: m.message_class,
                              mapi.PR_DISPLAY_TO: "; ".join(n for n, _a in m.to),
                              mapi.PR_MESSAGE_FLAGS: (1 if m.read else 0) | (0x10 if (m.attachments or m.embedded) else 0),
@@ -602,6 +628,12 @@ def write_pst(path: str, root_folders: List[SynthFolder], store_name: str = "Syn
     snb = NodeBuilder(w)
     w.add_node(0x21, build_pc(w, snb, {mapi.PR_DISPLAY_NAME: (mapi.PT_UNICODE, store_name),
                                        mapi.PR_MESSAGE_CODEPAGE: (mapi.PT_LONG, 1252)}), snb.bid_sub(), 0)
+    # name-to-id map (node 0x61): bucket count, GUID stream, entry stream, string stream
+    guids, entries, strings = np.build_streams(NAMED_PST)
+    mnb = NodeBuilder(w)
+    w.add_node(NID_NAME_TO_ID_MAP, build_pc(w, mnb, {0x0001: (mapi.PT_LONG, 251), 0x0002: (mapi.PT_BINARY, guids),
+                                                     0x0003: (mapi.PT_BINARY, entries), 0x0004: (mapi.PT_BINARY, strings)}),
+               mnb.bid_sub(), 0)
     # root folder (nid 0x122) and its children
     root = SynthFolder("", subfolders=root_folders)
     write_folder(0x122, root, 0x122)
@@ -735,6 +767,13 @@ def _msg_props(st: _Node, props: Dict[int, Tuple[int, object]], header: bytes):
         if ptype in mapi.FIXED_SIZES and mapi.FIXED_SIZES[ptype] <= 8 or ptype == mapi.PT_BOOLEAN:
             data = encode_value(ptype, value)
             body += struct.pack("<II", (pid << 16) | ptype, 6) + data.ljust(8, b"\x00")[:8]
+        elif ptype == mapi.PT_MV_FLAG | mapi.PT_UNICODE:
+            # multi-valued strings: a length stream plus one stream per value ([MS-OXMSG] 2.1.3.2)
+            items = [str(v).encode("utf-16-le") + b"\x00\x00" for v in value]
+            st.stream(f"__substg1.0_{pid:04X}{ptype:04X}", b"".join(struct.pack("<I", len(it)) for it in items))
+            for i, it in enumerate(items):
+                st.stream(f"__substg1.0_{pid:04X}{ptype:04X}-{i:08X}", it)
+            body += struct.pack("<II", (pid << 16) | ptype, 6) + struct.pack("<II", 4 * len(items), 0)
         else:
             data = encode_value(ptype, value)
             if ptype in (mapi.PT_UNICODE,):
@@ -772,6 +811,7 @@ def build_msg_tree(m: SynthMessage, st: _Node, embedded: bool = False):
     if m.headers:
         props[mapi.PR_TRANSPORT_HEADERS] = (mapi.PT_UNICODE, m.headers)
     props.update(m.extra)
+    props.update(_named_props(m, NAMED_MSG))
     recips = [(1, n, a) for n, a in m.to] + [(2, n, a) for n, a in m.cc]
     natt = len(m.attachments) + (1 if m.embedded else 0)
     if embedded:
@@ -779,7 +819,13 @@ def build_msg_tree(m: SynthMessage, st: _Node, embedded: bool = False):
     else:
         header = b"\x00" * 8 + struct.pack("<IIII", len(recips), natt, len(recips), natt) + b"\x00" * 8
     _msg_props(st, props, header)
-    st.storage("__nameid_version1.0")
+    nameid = st.storage("__nameid_version1.0")
+    if not embedded:
+        # the name-to-id map lives at the top level only; embedded messages share it
+        guids, entries, strings = np.build_streams(NAMED_MSG)
+        nameid.stream("__substg1.0_00020102", guids)
+        nameid.stream("__substg1.0_00030102", entries)
+        nameid.stream("__substg1.0_00040102", strings)
     for i, (kind, name, addr) in enumerate(recips):
         rs = st.storage(f"__recip_version1.0_#{i:08X}")
         _msg_props(rs, {mapi.PR_RECIPIENT_TYPE: (mapi.PT_LONG, kind), mapi.PR_DISPLAY_NAME: (mapi.PT_UNICODE, name),

@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime as _dt
 import os
 import struct
+import threading
 from typing import Any, Dict, Iterator, List, Optional
 
 from . import mapi, rtf
@@ -461,10 +462,39 @@ class PropertyMessage:
             return bool(self.flags & mapi.MSGFLAG_HASATTACH) or bool(self.attachments())
         return bool(v)
 
+    # -- named properties ----------------------------------------------------
+    def name_map(self):
+        """The file's name-to-id table (namedprops.NameMap); empty when the source has none."""
+        from .namedprops import NameMap
+        return NameMap()
+
+    def named(self, guid, ident, default=None):
+        """A named property by (property set GUID, numeric id or string name)."""
+        tag = self.name_map().lookup(guid, ident)
+        if tag is None:
+            return default
+        return self.get(tag, default)
+
+    def named_text(self, guid, ident) -> str:
+        v = self.named(guid, ident)
+        if v is None:
+            return ""
+        if isinstance(v, bytes):
+            return mapi.decode_string8(v, self.cpid)
+        return v if isinstance(v, str) else str(v)
+
+    def property_name(self, pid: int) -> str:
+        """Readable name for the inspector: canonical for fixed tags, resolved for named ones."""
+        if pid >= 0x8000:
+            n = self.name_map().name_of(pid)
+            if n:
+                return n
+        return mapi.tag_name(pid)
+
     def all_properties(self) -> Iterator[tuple]:
         """(id, name, type, value) for every property - for the property inspector."""
         for pid, ptype, val in self.pc.items():
-            yield pid, mapi.tag_name(pid), ptype, val
+            yield pid, self.property_name(pid), ptype, val
 
     def __repr__(self):
         return f"{type(self).__name__}(0x{self.nid:x}, {self.subject!r})"
@@ -527,6 +557,9 @@ class Message(PropertyMessage):
         if v is None:
             return bool(self.flags & mapi.MSGFLAG_HASATTACH) or self.node.subnode(NID_ATTACHMENT_TABLE) is not None
         return bool(v)
+
+    def name_map(self):
+        return self.pst.name_map()
 
 
 class Folder:
@@ -681,6 +714,21 @@ class PSTFile:
         self.root.load_properties()
         if not self.root.name:
             self.root.name = self.store_name or os.path.splitext(self.name)[0]
+        self._name_map = None
+        self._name_map_lock = threading.Lock()
+
+    def name_map(self):
+        """The file's named-property table, read once on first use (any thread)."""
+        if self._name_map is None:
+            with self._name_map_lock:
+                if self._name_map is None:
+                    from .namedprops import NameMap
+                    nm = NameMap.from_pst(self)
+                    if nm.error and nm.error not in self.warnings:
+                        self.warnings.append(nm.error + " - named properties (contact e-mail addresses, "
+                                                        "categories) cannot be read")
+                    self._name_map = nm
+        return self._name_map
 
     @property
     def description(self) -> str:
