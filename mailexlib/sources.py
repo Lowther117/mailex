@@ -1030,8 +1030,10 @@ class MaildirSource(MailSource):
                 if "T" in flags:
                     continue            # trashed: flagged for deletion
                 try:
-                    raw = _head_bytes(p)
                     size = os.path.getsize(p)
+                    if size == 0:
+                        continue        # never a message; an aborted delivery at most
+                    raw = _head_bytes(p)
                     mtime = _dt.datetime.fromtimestamp(os.path.getmtime(p), _dt.timezone.utc)
                 except OSError:
                     continue

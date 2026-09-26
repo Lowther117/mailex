@@ -416,10 +416,13 @@ def _check_sources(record, tmp: str, mailbox_def):
     md = os.path.join(base, "Maildir")
     for sub in ("cur", "new", "tmp", ".Projects/cur", ".Projects/new", ".Projects/tmp"):
         os.makedirs(os.path.join(md, sub))
+    # ':' is the Unix flag separator; on NTFS a colon makes an alternate data
+    # stream instead of a file name, so Maildirs there use '!' - as does this test
+    sep = "!" if os.name == "nt" else ":"
     for i, x in enumerate(a[:6]):
-        shutil.copy(x, os.path.join(md, "cur" if i % 2 == 0 else "new", f"{i}.mail" + (":2,S" if i % 2 == 0 else "")))
+        shutil.copy(x, os.path.join(md, "cur" if i % 2 == 0 else "new", f"{i}.mail" + (sep + "2,S" if i % 2 == 0 else "")))
     for i, x in enumerate(a[6:9]):
-        shutil.copy(x, os.path.join(md, ".Projects", "cur", f"{i}.mail:2,"))
+        shutil.copy(x, os.path.join(md, ".Projects", "cur", f"{i}.mail{sep}2,"))
     src = MaildirSource(md)
     root_rows = src.root.messages()
     proj = [f for f in src.root.walk() if f.name == "Projects"]
@@ -478,12 +481,12 @@ def _check_sources(record, tmp: str, mailbox_def):
         ok = counts.get("Local Folders/Archives/2019") == 230 and counts.get("Local Folders/Archives") == 0
     record("Thunderbird folder whose own mbox is empty", ok, str(found))
 
-    # a Maildir copied through Windows uses '!' instead of ':' in the flags
+    # a Maildir copied through Windows uses '!' (or ';') instead of ':' in the flags
     md2 = os.path.join(base, "Maildir-win")
     for sub in ("cur", "new", "tmp"):
         os.makedirs(os.path.join(md2, sub))
     shutil.copy(a[0], os.path.join(md2, "cur", "1.mail!2,S"))
-    shutil.copy(a[1], os.path.join(md2, "cur", "2.mail!2,"))
+    shutil.copy(a[1], os.path.join(md2, "cur", "2.mail;2,"))
     shutil.copy(a[2], os.path.join(md2, "cur", "3.mail!2,ST"))
     rows2 = MaildirSource(md2).root.messages()
     record("Maildir flags with '!' separator, trashed skipped", len(rows2) == 2 and rows2[0].read and not rows2[1].read,
