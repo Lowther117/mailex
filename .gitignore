@@ -1,0 +1,23 @@
+# build scratch
+.venv/
+.venv-build/
+.venv-build-mac/
+build/
+dist/
+*.spec
+
+# build and run output
+build-win-log.txt
+build-mac-log.txt
+pst-exporter-selftest.txt
+pst-exporter-crash.log
+pst-exporter-settings.json
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# os
+.DS_Store
+Thumbs.db
