@@ -277,7 +277,23 @@ def fold_line(line: str, limit: int = 75) -> str:
 
 
 def _date(d: Optional[_dt.datetime]) -> str:
-    return d.strftime("%Y-%m-%d") if d else ""
+    """A birthday / anniversary as YYYY-MM-DD.
+
+    Outlook stores PidTagBirthday as *local* midnight of the day converted to
+    UTC, so a 10 May birthday entered in the UK in summer sits in the file as
+    9 May 23:00Z; reading the UTC date back gives the day before. Rounding to
+    the nearest day (add twelve hours, take the date) recovers the intended day
+    for every zone from UTC-11 to UTC+12, and leaves a value already at UTC
+    midnight or at the spec's 11:59 UTC alone."""
+    if not d:
+        return ""
+    if d.tzinfo is not None:
+        d = d.astimezone(_dt.timezone.utc)
+    try:
+        d = d + _dt.timedelta(hours=12)
+    except OverflowError:
+        pass
+    return d.strftime("%Y-%m-%d")
 
 
 def vcard(c: Contact) -> str:

@@ -512,6 +512,10 @@ class Exporter:
                 self._write_contacts()
             except Exception as exc:  # noqa: BLE001
                 self.result.errors.append(f"contacts.vcf / contacts.csv: {exc}")
+        elif self.o.fmt == "vcf" and self.result.skipped and not self.result.exported:
+            self.result.warnings.append(f"no contact items among the {self.result.skipped} messages given - "
+                                        "nothing was written (contacts live in a Contacts folder; use a folder or "
+                                        "the Contacts filter that holds them)")
         if self.o.write_index and self.result.index:
             try:
                 self._write_index()

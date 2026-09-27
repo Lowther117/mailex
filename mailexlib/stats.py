@@ -103,7 +103,7 @@ def compute(rows: Iterable, label: str = "", att_info: Optional[AttInfoFn] = Non
     folders = {r.folder.path_str for r in rows}
     ov = Table("overview", "Overview", ["Measure", "Value"])
     ov.rows.append(["Messages / items", f"{total:,}"])
-    ov.rows.append(["Files", f"{len(files):,}" + (": " + ", ".join(sorted(files)) if len(files) <= 5 else "")])
+    ov.rows.append(["Files", f"{len(files):,}" + (": " + ", ".join(sorted(files)) if 0 < len(files) <= 5 else "")])
     ov.rows.append(["Folders with items", f"{len(folders):,}"])
     if dated:
         ov.rows.append(["Earliest", min(dated).strftime("%Y-%m-%d %H:%M")])
@@ -222,7 +222,7 @@ def compute(rows: Iterable, label: str = "", att_info: Optional[AttInfoFn] = Non
     tl = Table("largest", f"{top} largest messages", ["Date", "From", "Subject", "Folder", "Size"])
     for r in sorted(rows, key=lambda r: -(r.size or 0))[:top]:
         d = local(r.date)
-        tl.rows.append([d.strftime("%Y-%m-%d %H:%M") if d else "", r.sender, r.subject or "(no subject)",
+        tl.rows.append([d.strftime("%Y-%m-%d %H:%M") if d else "", r.sender or "", r.subject or "(no subject)",
                         r.folder.path_str, _size(r.size)])
     tables.append(tl)
 

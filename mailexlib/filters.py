@@ -44,9 +44,14 @@ def parse_date_bound(text: Optional[str], end: bool = False) -> Optional[_dt.dat
             start = _dt.datetime(year, 1, 1)
             nxt = _dt.datetime(year + 1, 1, 1) if year < 9999 else start + _dt.timedelta(days=365)
         bound = start if not end else nxt - _dt.timedelta(microseconds=1)
+    except (ValueError, OverflowError):
+        return None
+    try:
         return bound.astimezone()          # naive local -> aware local
     except (ValueError, OverflowError, OSError):
-        return None
+        # Windows cannot localise dates before 1970 (or far in the future); use
+        # today's offset rather than refusing the date
+        return bound.replace(tzinfo=_dt.datetime.now().astimezone().tzinfo)
 
 
 def _aware(d: _dt.datetime) -> _dt.datetime:

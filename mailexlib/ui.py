@@ -24,7 +24,7 @@ from .sources import FILE_TYPES, MailSource, find_sources, open_found, open_sour
 _HIDE_FOLDERS = {"IPM_SUBTREE"}  # shown flattened - their children matter, they do not
 _OPEN_HINT = "Open a mailbox to begin - PST, OST, MBOX, Thunderbird, Apple Mail, Maildir, EML or MSG."
 BODY_CACHE_CHARS = 65536            # of body text kept per message for "search bodies too"
-BODY_CACHE_BUDGET = 400_000_000     # total characters before later bodies are kept short (8 KB)
+BODY_CACHE_BUDGET = 64_000_000      # total characters (roughly 64-256 MB of RAM) before later bodies are kept short (8 KB)
 
 
 class App(ttk.Frame):
@@ -339,6 +339,10 @@ class App(ttk.Frame):
             # selection to that row before the drag could start; hold it until
             # the release says it was just a click
             self._press_item = item
+            try:
+                self.list.focus_set()   # the class binding we are stopping would have done this
+            except tk.TclError:
+                pass
             return "break"
         self._press_item = None
         return None
@@ -962,6 +966,7 @@ class App(ttk.Frame):
             entry = self._details.setdefault(id(row), [row, None, None])
             if entry[1] is None:
                 entry[1] = text[:BODY_CACHE_CHARS]
+                self._details_chars += len(entry[1])
             if entry[2] is None:
                 entry[2] = [(n, inline, sz) for n, sz, _emb, inline in atts]
             return msg, text, atts, contact

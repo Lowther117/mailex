@@ -177,6 +177,9 @@ def cmd_export(argv: List[str]) -> int:
     for p in psts:
         p.close()
     print(res.summary())
+    if res.warnings and not res.exported:
+        for w in res.warnings[:3]:
+            print("  " + w)
     if res.errors:
         print(f"{len(res.errors)} errors - see export-log.txt in the output folder")
         for e in res.errors[:10]:
@@ -200,7 +203,9 @@ def cmd_stats(argv: List[str]) -> int:
 
     def att_info(row):
         try:
-            return [(x.filename, x.size or len(x.data or b"")) for x in row.open().attachments() if not x.hidden]
+            # the same rule as the window: inline pictures (signature logos) are not counted
+            return [(x.filename, x.size or len(x.data or b"")) for x in row.open().attachments()
+                    if not (x.hidden or x.is_inline)]
         except Exception:  # noqa: BLE001
             return None
 

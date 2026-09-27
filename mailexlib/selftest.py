@@ -309,6 +309,15 @@ def _check_units(record):
     row = _contacts.csv_row(c, "f.pst", "Contacts")
     record("contact CSV row", row["display_name"] == "Zoë, Jr; Test" and row["email1"] == "z@example.com"
            and row["mobile_phone"] == "+1 555" and list(row) == _contacts.CSV_COLUMNS)
+    # Outlook keeps a birthday as local midnight in UTC: 10 May entered in BST is 9 May 23:00Z in the file
+    utc = _dt.timezone.utc
+    bdays = [_contacts.vcard(_contacts.Contact(given="B", birthday=d)).split("BDAY:")[1][:10] for d in
+             (_dt.datetime(1990, 5, 9, 23, 0, tzinfo=utc), _dt.datetime(1990, 5, 10, 5, 0, tzinfo=utc),
+              _dt.datetime(1990, 5, 10, tzinfo=utc), _dt.datetime(1990, 5, 10, 11, 59, tzinfo=utc))]
+    record("vCard birthday is the intended day, not the UTC one", bdays == ["1990-05-10"] * 4, str(bdays))
+    since_old = parse_date_bound("1965-06")
+    record("date bound before 1970 still parses", since_old is not None and since_old.tzinfo is not None
+           and since_old.year == 1965 and since_old.month == 6, str(since_old))
 
     # ---- the name-to-id map parser on hand-built streams (string names, GUID index, bad entries)
     g, en, st = np.build_streams([(np.PSETID_ADDRESS, 0x8083), (np.PS_PUBLIC_STRINGS, "Keywords"), (np.PSETID_COMMON, 0x8503)])
