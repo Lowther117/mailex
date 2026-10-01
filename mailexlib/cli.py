@@ -16,6 +16,8 @@ USAGE = f"""{APP} {VERSION} - open any mailbox, export it any way
   mailex list SOURCE...                   print the folder tree with message counts
   mailex stats SOURCE... [options]        mailbox statistics as text, CSV or HTML
   mailex info SOURCE...                   print what kind of mailbox it is
+  mailex index SOURCE... [options]        add mailboxes to the content index (bodies and attachments)
+  mailex find QUERY [options]             search the content index; optionally export the hits
   mailex selftest [FILE ...]              build synthetic mailboxes in every format, read and export them
 
 SOURCE is a file - Outlook .pst / .ost, an .mbox, a single .eml / .emlx / .msg -
@@ -48,6 +50,28 @@ stats options:
   --html FILE           also write a single self-contained HTML page
   --folder PATH         only this folder (and its subfolders)
   --quick               do not open messages for attachment counts and sizes
+
+index options:
+  --db FILE             the index file (default: mailex-index.db beside the app, or the one set in the window)
+  --force               re-read mailboxes that are already indexed
+  --stats               print what the index holds and stop
+  --prune               forget mailboxes whose files no longer exist
+  --remove              take the given SOURCEs out of the index instead of adding them
+  --clear               empty the index
+
+find options:
+  --db FILE             the index file
+  -n, --limit N         at most N hits (default 200)
+  --json                print the hits as JSON
+  --export DIR          export the hits to DIR (opens the mailboxes they came from)
+  -f, --format FMT      with --export: eml (default), mbox, pdf, html, txt, attachments, vcf
+
+query syntax (the same in the window):
+  invoice 2023          every word, in any field        "exact phrase"
+  from:bob to:alice     sender / recipients             subject:renewal  body:total
+  att:pdf  att:"q4 report"   attachment names and contents
+  in:inbox  source:work.pst  folder path / mailbox       has:att
+  after:2023-06  before:2024   date window                !spam  -newsletter   must not contain
 """
 
 
@@ -265,6 +289,123 @@ def cmd_info(argv: List[str]) -> int:
     return 0
 
 
+def _indexer(db: str):
+    from .indexer import Indexer, default_db_path
+    from .paths import load_settings
+    return Indexer(db or default_db_path(load_settings()))
+
+
+def cmd_index(argv: List[str]) -> int:
+    ap = argparse.ArgumentParser(prog="mailex index", add_help=True)
+    ap.add_argument("sources", nargs="*")
+    ap.add_argument("--db", default="")
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--stats", action="store_true")
+    ap.add_argument("--prune", action="store_true")
+    ap.add_argument("--remove", action="store_true")
+    ap.add_argument("--clear", action="store_true")
+    a = ap.parse_args(argv)
+    from .indexer import human_size
+    ix = _indexer(a.db)
+    try:
+        if a.clear:
+            ix.clear()
+            print(f"index emptied: {ix.db_path}")
+        if a.prune:
+            gone = ix.prune_missing()
+            print(f"{len(gone)} missing mailbox(es) forgotten" + ("".join("\n  " + g for g in gone)))
+        if a.remove:
+            for kind, f in _find_sources(a.sources):
+                n = ix.remove_source(f)
+                print(f"removed {f}: {n} messages")
+        elif a.sources:
+            found = _find_sources(a.sources)
+            if not found:
+                print("nothing to index", file=sys.stderr)
+                return 2
+            last = [-1.0]
+
+            def progress(i, n, label):
+                import time as _t
+                if _t.time() - last[0] >= 1.0 or (n and i >= n):
+                    last[0] = _t.time()
+                    print(f"  {label[:90]}", flush=True)
+
+            for kind, f in found:
+                try:
+                    src = _open(kind, f)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"cannot open {f}: {exc}", file=sys.stderr)
+                    continue
+                res = ix.index_source(src, progress=progress, force=a.force)
+                src.close()
+                print(res.summary)
+                for note in res.notes:
+                    print("  " + note)
+            try:
+                ix.optimize()
+            except Exception:  # noqa: BLE001
+                pass
+        if a.stats or not (a.sources or a.clear or a.prune):
+            st = ix.stats()
+            print(f"index: {st['path']}  ({human_size(st['bytes'])})")
+            print(f"  {st['sources']} mailbox(es), {st['messages']:,} messages, {st['attachments']:,} attachments "
+                  f"({st['messages_with_attachment_text']:,} messages with searchable attachment text)")
+            print(f"  PDF text: {st['pdf_engine']}   SQLite {st['sqlite']}")
+            for r in ix.sources():
+                state = "complete" if r["complete"] else "partial"
+                print(f"  - {r['name']}  [{r['kind']}]  {r['messages']:,} messages, {state}  {r['path']}")
+        return 0
+    finally:
+        ix.close()
+
+
+def cmd_find(argv: List[str]) -> int:
+    ap = argparse.ArgumentParser(prog="mailex find", add_help=True)
+    ap.add_argument("query", nargs="+")
+    ap.add_argument("--db", default="")
+    ap.add_argument("-n", "--limit", type=int, default=200)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--export", default="")
+    ap.add_argument("-f", "--format", default="eml", choices=["eml", "mbox", "pdf", "html", "txt", "attachments", "vcf"])
+    a = ap.parse_args(argv)
+    query = " ".join(a.query)
+    ix = _indexer(a.db)
+    try:
+        hits = ix.search(query, limit=a.limit)
+        if a.json:
+            import json
+            print(json.dumps([{
+                "subject": h.subject, "from": h.sender, "from_email": h.sender_email, "to": h.recipients,
+                "date": h.date.isoformat() if h.date else None, "folder": h.folder, "mailbox": h.source_path,
+                "attachments": h.att_names, "matched_in": h.where, "snippet": h.snippet, "size": h.size,
+            } for h in hits], indent=1, ensure_ascii=False))
+        else:
+            total = ix.count(query)
+            print(f"{len(hits)} of {total} hit(s) for {query!r}")
+            for h in hits:
+                d = h.date.strftime("%Y-%m-%d") if h.date else "          "
+                print(f"  {d}  {h.sender[:28]:28}  {h.subject[:60]}")
+                print(f"              {h.source_name} / {h.folder}" + (f"   [{h.where}] {h.snippet[:110]}" if h.snippet else ""))
+        if a.export and hits:
+            from .export import ExportOptions, Exporter
+            from .indexer import Resolver
+            rs = Resolver()
+            pairs = rs.rows_for(hits)
+            for p, err in rs.errors.items():
+                print(f"cannot open {p}: {err}", file=sys.stderr)
+            rows = [r for _h, r in pairs]
+            print(f"exporting {len(rows)} of {len(hits)} hits -> {a.export} as {a.format}")
+            opts = ExportOptions(fmt=a.format, out_dir=a.export)
+            res = Exporter(opts, lambda i, n, label: None).run(rows)
+            print(res.summary())
+            rs.close_auto_opened()
+            return 0 if not res.failed else 1
+        return 0 if hits else 1
+    finally:
+        ix.close()
+
+
 def main(argv: List[str]) -> int:
     if argv and argv[0].lower() in ("-h", "--help", "help"):
         print(USAGE)
@@ -280,6 +421,10 @@ def main(argv: List[str]) -> int:
         return cmd_list(argv[1:])
     if argv and argv[0].lower() == "info":
         return cmd_info(argv[1:])
+    if argv and argv[0].lower() == "index":
+        return cmd_index(argv[1:])
+    if argv and argv[0].lower() in ("find", "search"):
+        return cmd_find(argv[1:])
     if argv and argv[0].lower() in ("-v", "--version", "version"):
         print(f"{APP} {VERSION}")
         return 0

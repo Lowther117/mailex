@@ -99,9 +99,19 @@ echo "[3/7] Installing dependencies (wheels only, no compiling)..."
 "$VPY" -m pip install --upgrade pip wheel >/dev/null || die "pip would not upgrade."
 "$VPY" -m pip install --only-binary :all: -r "$HERE/requirements.txt" || die "A dependency has no wheel for this Mac."
 "$VPY" -m pip install --only-binary :all: pyinstaller || die "PyInstaller would not install."
+# Optional: PyMuPDF reads complex PDFs better for the content index. No wheel for
+# this Python is not an error - the built-in PDF reader takes over.
+PDF_EXTRA=""
+if "$VPY" -m pip install --only-binary :all: -r "$HERE/requirements-optional.txt" >/dev/null 2>&1 \
+   && "$VPY" -c "import pymupdf" >/dev/null 2>&1; then
+  echo "      PyMuPDF installed (better PDF text for the index)."
+  PDF_EXTRA="--collect-all pymupdf --hidden-import fitz"
+else
+  echo "      PyMuPDF has no wheel for this Python - PDFs will use the built-in reader."
+fi
 
 echo "[4/7] Checking the code before packaging..."
-"$VPY" -c "import sys; sys.path.insert(0,'.'); import mailexlib.ui, mailexlib.export, mailexlib.pdfout; print('      imports ok')" \
+"$VPY" -c "import sys; sys.path.insert(0,'.'); import mailexlib.ui, mailexlib.export, mailexlib.pdfout, mailexlib.indexer; print('      imports ok')" \
   || die "The application does not import cleanly."
 
 echo "[5/7] Packaging (this takes a minute or two)..."
@@ -117,7 +127,9 @@ rm -rf "$HERE/build" "$HERE/dist"
   --hidden-import tkinter.ttk \
   --hidden-import tkinter.filedialog \
   --hidden-import tkinter.messagebox \
+  --hidden-import sqlite3 \
   --exclude-module pytest \
+  $PDF_EXTRA \
   "$HERE/mailex_app.py" || die "PyInstaller failed - see the log above."
 [ -d "$HERE/dist/Mailex.app" ] || die "dist/Mailex.app was not produced."
 

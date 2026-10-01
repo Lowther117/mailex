@@ -6,7 +6,7 @@ import os
 import sys
 
 APP = "Mailex"
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 SETTINGS_NAME = "mailex-settings.json"
 
 

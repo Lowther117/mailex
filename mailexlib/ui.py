@@ -17,6 +17,7 @@ from . import contacts as _contacts
 from . import dnd, theme
 from .export import FORMATS, ExportOptions, ExportResult, Exporter, eml_bytes, human_size, local, sanitize
 from .filters import ATT_TYPE_LABELS, ATT_TYPES, RowFilter, parse_date_bound, parse_extensions
+from .indexer import Hit, Indexer, Resolver, default_db_path
 from .message import Folder, Message, MessageRow, PSTFile
 from .paths import APP, VERSION, default_save_dir, downloads_dir, load_settings, save_settings
 from .sources import FILE_TYPES, MailSource, find_sources, open_found, open_source
@@ -77,6 +78,17 @@ class App(ttk.Frame):
         self._fill_token = 0
         self._exporting = False
         self._iid_of_row: Dict[int, str] = {}
+        # the content index: bodies and attachments of every indexed mailbox, searched from the same box
+        self.index_var = tk.BooleanVar(value=False)
+        self.auto_index = tk.BooleanVar(value=bool(self.settings.get("auto_index", False)))
+        self._indexer: Optional[Indexer] = None
+        self._indexer_error = ""
+        self._resolver = Resolver()
+        self._indexing = False
+        self._cancel_index = threading.Event()
+        self._index_token = 0
+        self._hit_of_row: Dict[int, Hit] = {}
+        self._index_note = ""
 
         root.title(f"{APP} - open any mailbox, export it any way")
         root.geometry(self.settings.get("geometry") or self._default_geometry(root))
@@ -107,14 +119,17 @@ class App(ttk.Frame):
             pass
         self.settings.update(dark=self.dark, geometry=self.root.geometry(),
                              include_subfolders=bool(self.include_sub.get()),
-                             only_mail=bool(self.only_mail.get()))
+                             only_mail=bool(self.only_mail.get()), auto_index=bool(self.auto_index.get()))
         save_settings(self.settings)
 
     def _on_close(self):
-        if self._exporting:
-            if not messagebox.askyesno(APP, "An export is still running. Stop it and quit?"):
+        if self._exporting or self._indexing:
+            what = "An export" if self._exporting else "Indexing"
+            if not messagebox.askyesno(APP, f"{what} is still running. Stop it and quit?"):
                 return
-            self._cancel_export.set()
+            if self._exporting:
+                self._cancel_export.set()
+            self._cancel_index.set()
             # let the worker finish the current message, then go
             self.after(400, self._on_close_after_cancel)
             return
@@ -124,11 +139,14 @@ class App(ttk.Frame):
                 f.close()
             except Exception:  # noqa: BLE001
                 pass
+        self._resolver.close_auto_opened()
+        if self._indexer is not None:
+            self._indexer.close()
         self._drag_folder.cleanup()
         self.root.destroy()
 
     def _on_close_after_cancel(self):
-        if self._exporting:
+        if self._exporting or self._indexing:
             self.after(400, self._on_close_after_cancel)
             return
         self._on_close()
@@ -136,6 +154,9 @@ class App(ttk.Frame):
     def _busy_with_export(self) -> bool:
         if self._exporting:
             messagebox.showinfo(APP, "Wait for the export to finish (or cancel it) first.")
+            return True
+        if self._indexing:
+            messagebox.showinfo(APP, "Wait for the indexing to finish (or cancel it) first.")
             return True
         return False
 
@@ -177,11 +198,27 @@ class App(ttk.Frame):
         v.add_separator()
         v.add_command(label="Clear all filters", command=self.clear_filters)
         m.add_cascade(label="View", menu=v)
+        x = tk.Menu(m, tearoff=0)
+        x.add_command(label="Index the open mailboxes now", accelerator="Ctrl+Shift+I", command=self.index_now)
+        x.add_command(label="Re-index the open mailboxes from scratch", command=lambda: self.index_now(force=True))
+        x.add_checkbutton(label="Index mailboxes automatically when they are opened", variable=self.auto_index,
+                          command=self._save_settings)
+        x.add_separator()
+        x.add_checkbutton(label="Search the index (message text and attachments)", accelerator="Ctrl+Shift+F",
+                          variable=self.index_var, command=self._index_toggled)
+        x.add_command(label="Search syntax…", command=self.show_index_syntax)
+        x.add_separator()
+        x.add_command(label="What is indexed…", command=self.show_index_stats)
+        x.add_command(label="Take the selected mailbox out of the index", command=self.unindex_selected)
+        x.add_command(label="Forget mailboxes whose files are gone", command=self.prune_index)
+        x.add_command(label="Index location…", command=self.choose_index_location)
+        x.add_command(label="Clear the whole index…", command=self.clear_index)
+        m.add_cascade(label="Index", menu=x)
         h = tk.Menu(m, tearoff=0)
         h.add_command(label="How it works", command=self.show_guide)
         h.add_command(label=f"About {APP}", command=self.show_about)
         m.add_cascade(label="Help", menu=h)
-        self.menus = [m, f, e, v, h]
+        self.menus = [m, f, e, v, x, h]
         self.root.config(menu=m)
         mods = ["Control"] + (["Command"] if sys.platform == "darwin" else [])
         for mod in mods:
@@ -192,6 +229,8 @@ class App(ttk.Frame):
             self.root.bind(f"<{mod}-i>", lambda _e: self.show_inspector())
             self.root.bind(f"<{mod}-t>", lambda _e: self.show_stats())
             self.root.bind(f"<{mod}-d>", lambda _e: self.toggle_theme())
+            self.root.bind(f"<{mod}-Shift-I>", lambda _e: self.index_now())
+            self.root.bind(f"<{mod}-Shift-F>", lambda _e: self._toggle_index_mode())
         if sys.platform == "darwin":
             try:
                 self.root.createcommand("tk::mac::Quit", self._on_close)
@@ -225,7 +264,10 @@ class App(ttk.Frame):
         self.search_entry = ttk.Entry(flt, textvariable=self.search_var, width=26)
         self.search_entry.pack(side="left")
         self.search_entry.bind("<Escape>", lambda _e: self.search_var.set(""))
-        ttk.Checkbutton(flt, text="Search bodies too", variable=self.body_var, command=self._schedule_search).pack(side="left", padx=(6, 14))
+        self.body_check = ttk.Checkbutton(flt, text="Search bodies too", variable=self.body_var, command=self._schedule_search)
+        self.body_check.pack(side="left", padx=(6, 0))
+        self.index_check = ttk.Checkbutton(flt, text="Search index", variable=self.index_var, command=self._index_toggled)
+        self.index_check.pack(side="left", padx=(6, 14))
         ttk.Label(flt, text="From").pack(side="left", padx=(0, 4))
         self.from_entry = ttk.Entry(flt, textvariable=self.from_var, width=11)
         self.from_entry.pack(side="left")
@@ -262,10 +304,13 @@ class App(ttk.Frame):
         self.vpane = ttk.Panedwindow(self.pane, orient="vertical")
         self.pane.add(self.vpane, weight=4)
         top = ttk.Frame(self.vpane)
-        cols = ("date", "from", "subject", "to", "size", "att")
-        self.list = ttk.Treeview(top, columns=cols, show="headings", selectmode="extended")
+        cols = ("date", "from", "subject", "to", "size", "att", "match")
+        self._plain_columns = ("date", "from", "subject", "to", "size", "att")
+        self._index_columns = ("date", "from", "subject", "match", "size", "att")
+        self.list = ttk.Treeview(top, columns=cols, displaycolumns=self._plain_columns, show="headings", selectmode="extended")
         heads = {"date": ("Date", 140, False), "from": ("From", 180, True), "subject": ("Subject", 380, True),
-                 "to": ("To", 180, True), "size": ("Size", 70, False), "att": ("Att", 40, False)}
+                 "to": ("To", 180, True), "size": ("Size", 70, False), "att": ("Att", 40, False),
+                 "match": ("Matched text", 420, True)}
         for c in cols:
             text, width, stretch = heads[c]
             self.list.heading(c, text=text, command=lambda cc=c: self._sort_by(cc))
@@ -588,6 +633,9 @@ class App(ttk.Frame):
             msg += "  Could not open: " + "; ".join(failed)
             messagebox.showwarning(APP, "Some files could not be opened:\n\n" + "\n".join(failed))
         self.status_msg(msg, "Good.TLabel" if not failed else "Warn.TLabel")
+        new_files = [pst for _p, pst, _f, exc in res if exc is None]
+        if new_files and self.auto_index.get() and not self._indexing:
+            self.after(300, lambda: self.index_now(files=new_files, quiet=True))
         if first_item is not None:
             # select the Inbox of the first new file, else its first folder with messages
             new_file = self.file_of_item[first_item]
@@ -650,6 +698,7 @@ class App(ttk.Frame):
             if self.tree.exists(iid) and not self.tree.parent(iid):
                 self.tree.delete(iid)
         self.files = [f for f in self.files if f is not pst]
+        self._resolver.forget(pst.path)
         self._list_token += 1          # stop any listing / fill job for this file
         self._preview_token += 1
         pst.close()
@@ -672,9 +721,16 @@ class App(ttk.Frame):
         if not sel:
             return
         self.current_folder = self.folder_of_item.get(sel[0])
+        if self.index_var.get():
+            # clicking a folder means "show me this folder": leave the index results
+            self.index_var.set(False)
+            self._index_mode_changed()
         self._refresh_list()
 
     def _refresh_list(self):
+        if self.index_var.get():
+            self._schedule_search()        # the index results stay; the toggles re-run the search
+            return
         folder = self.current_folder
         if folder is None:
             return
@@ -748,7 +804,10 @@ class App(ttk.Frame):
         self.to_entry.configure(style="Bad.TEntry" if (self.to_var.get().strip() and until is None) else "TEntry")
         label = self.att_type_var.get()
         kind = next((k for k, v in ATT_TYPE_LABELS.items() if v == label), "all")
-        return RowFilter(text=self.search_var.get(), search_body=bool(self.body_var.get()), since=since, until=until,
+        indexed = bool(self.index_var.get())
+        # in index mode the words went to the index already; only the other filters narrow the hits
+        return RowFilter(text="" if indexed else self.search_var.get(),
+                         search_body=bool(self.body_var.get()) and not indexed, since=since, until=until,
                          has_attachments=bool(self.has_att_var.get()), attachment_type=kind,
                          contacts_only=bool(self.contacts_var.get()))
 
@@ -780,6 +839,9 @@ class App(ttk.Frame):
     def _apply_filter_now(self):
         self._search_job = None
         self._last_filter_apply = time.time()
+        if self.index_var.get():
+            self._index_search()
+            return
         self._show_rows(self._filtered(self.current_rows))
 
     def clear_filters(self):
@@ -902,13 +964,17 @@ class App(ttk.Frame):
             "to": lambda r: r.to.lower(),
             "size": lambda r: r.size,
             "att": lambda r: r.has_attachments,
+            "match": lambda r: (self._hit_of_row[id(r)].score if id(r) in self._hit_of_row else 0.0),
         }[col]
         rows = sorted(rows, key=keyfn, reverse=desc)
         self._pending_rows = rows
         self._insert_batch(0, self._show_token)
         n = len(rows)
         flt = self._current_filter()
-        if flt.active or flt.needs_body:
+        if self.index_var.get():
+            extra = f"; {flt.describe()}" if flt.active else ""
+            self.status_msg(f"{n:,} of {len(self.current_rows):,} index hits shown{extra}.{self._index_note}")
+        elif flt.active or flt.needs_body:
             reading = "  (still reading…)" if self._details_busy else ""
             self.status_msg(f"{n:,} of {len(self.current_rows):,} items match: {flt.describe()}.{reading}")
 
@@ -921,10 +987,12 @@ class App(ttk.Frame):
             r = rows[i]
             iid = f"m{i}"
             tags = () if r.read else ("unread",)
+            hit = self._hit_of_row.get(id(r))
+            match = (f"{hit.where}: {hit.snippet}" if hit.snippet else f"in {hit.source_name} / {hit.folder}") if hit else ""
             self.list.insert("", "end", iid=iid, tags=tags, values=(
                 local(r.date).strftime("%Y-%m-%d %H:%M") if r.date else "",
                 r.sender, r.subject or "(no subject)", r.to, human_size(r.size),
-                "yes" if r.has_attachments else ""))
+                "yes" if r.has_attachments else "", match))
             self.rows_of_item[iid] = r
             self._iid_of_row[id(r)] = iid
         if end < len(rows):
@@ -1237,6 +1305,306 @@ class App(ttk.Frame):
         self._save_settings()
         self.status_msg(f"Exports and saved files will go to {downloads_dir()}.", "Good.TLabel")
 
+    # -------------------------------------------------------------- index
+    def _get_indexer(self) -> Optional[Indexer]:
+        """The index, opened on first use; None (with a message) when it cannot be."""
+        if self._indexer is not None:
+            return self._indexer
+        try:
+            self._indexer = Indexer(default_db_path(self.settings))
+            self._indexer_error = ""
+        except Exception as exc:  # noqa: BLE001
+            self._indexer_error = str(exc)
+            messagebox.showerror(APP, f"The content index could not be opened:\n{exc}\n\n"
+                                      "Use Index > Index location… to put it somewhere else, or Clear the whole index.")
+            return None
+        return self._indexer
+
+    def _toggle_index_mode(self):
+        self.index_var.set(not self.index_var.get())
+        self._index_toggled()
+
+    def _index_toggled(self):
+        if self.index_var.get():
+            ix = self._get_indexer()
+            if ix is None:
+                self.index_var.set(False)
+                return
+            try:
+                st = ix.stats()
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showerror(APP, f"The index could not be read: {exc}")
+                self.index_var.set(False)
+                return
+            if not st["messages"]:
+                self.index_var.set(False)
+                if self.files:
+                    if messagebox.askyesno(APP, "Nothing has been indexed yet.\n\nIndex the open mailboxes now? "
+                                                "Every message is read once, with its attachments, so this takes a "
+                                                "while for a large file - afterwards searches are instant."):
+                        self.index_now(then_search=True)
+                else:
+                    messagebox.showinfo(APP, "Nothing has been indexed yet. Open a mailbox, then use "
+                                             "Index > Index the open mailboxes now.")
+                return
+            self._index_mode_changed()
+            self._schedule_search()
+            self.search_entry.focus_set()
+            return
+        # back to the folder view
+        self._index_token += 1
+        self._index_mode_changed()
+        if self.current_folder is not None:
+            self._refresh_list()
+        else:
+            self.current_rows = []
+            self._show_rows([])
+            self.status_msg("Index search off.")
+
+    def _index_mode_changed(self):
+        indexed = bool(self.index_var.get())
+        self.list.configure(displaycolumns=self._index_columns if indexed else self._plain_columns)
+        self.body_check.configure(state="disabled" if indexed else "normal")
+        self._sort = ("match", False) if indexed else ("date", True)
+        if not indexed:
+            self._hit_of_row.clear()
+            self._index_note = ""
+            self.search_entry.configure(style="TEntry")
+
+    def _index_search(self):
+        """Run the search box against the index; the hits become the listed rows,
+        so preview, selection, drag-out and every export work on them unchanged."""
+        ix = self._get_indexer()
+        if ix is None:
+            self.index_var.set(False)
+            self._index_mode_changed()
+            return
+        text = self.search_var.get()
+        self._index_token += 1
+        token = self._index_token
+        self._list_token += 1          # a folder listing in flight must not overwrite the hits
+        resolver = self._resolver
+        resolver.opened.update({os.path.abspath(f.path): f for f in self.files})
+
+        def work():
+            hits = ix.search(text, limit=2000, live=True)
+            pairs = resolver.rows_for(hits)
+            fresh = list(resolver.auto_opened)
+            for src in fresh:
+                _count_folders(src)
+                resolver.adopt(src)
+            st = ix.stats()
+            return hits, pairs, fresh, st
+
+        def done(res):
+            if token != self._index_token or not self.index_var.get():
+                return
+            if isinstance(res, BaseException):
+                self.status_msg(f"Index search failed: {res}", "Bad.TLabel")
+                return
+            hits, pairs, fresh, st = res
+            for src in fresh:
+                if not any(f is src for f in self.files):
+                    self.files.append(src)
+                    self._add_file_to_tree(src)
+            rows = [r for _h, r in pairs]
+            self._hit_of_row = {id(r): h for h, r in pairs}
+            self.current_rows = rows
+            missing = len(hits) - len(pairs)
+            note = ""
+            if missing:
+                bad = sorted({os.path.basename(p) for p in resolver.errors})
+                note = f"  {missing} hit{'s' if missing != 1 else ''} came from mailboxes that could not be opened"
+                note += (": " + ", ".join(bad[:4])) if bad else " (their messages are no longer in the file)"
+            if len(hits) >= 2000:
+                note += "  Showing the best 2,000 - add words to narrow it down."
+            if not text.strip():
+                note += f"  Type to search {st['messages']:,} indexed messages in {st['sources']} mailbox{'es' if st['sources'] != 1 else ''}."
+            self._index_note = note
+            self._show_rows(self._filtered(rows))
+
+        self._run_bg(work, done)
+
+    def index_now(self, files: Optional[List[MailSource]] = None, force: bool = False, quiet: bool = False,
+                  then_search: bool = False):
+        targets = files if files is not None else list(self.files)
+        if not targets:
+            if not quiet:
+                messagebox.showinfo(APP, "Open a mailbox first; the index is built from the open files.")
+            return
+        if self._exporting or self._indexing:
+            if not quiet:
+                self._busy_with_export()
+            return
+        ix = self._get_indexer()
+        if ix is None:
+            return
+        cancel = threading.Event()
+        self._cancel_index = cancel
+        self._indexing = True
+        prog = ProgressWindow(self, 0, cancel, verb="Indexing")
+
+        def progress(i, n, label):
+            self.post(lambda _r: prog.update_progress(i, n, label))
+
+        def work():
+            return ix.index_many(targets, progress=progress, cancel=cancel, force=force)
+
+        def done(res):
+            self._indexing = False
+            prog.close()
+            if isinstance(res, BaseException):
+                messagebox.showerror(APP, f"Indexing failed:\n{res}")
+                self.status_msg(f"Indexing failed: {res}", "Bad.TLabel")
+                return
+            added = sum(r.added for r in res)
+            removed = sum(r.removed for r in res)
+            atts = sum(r.attachments for r in res)
+            errors = sum(r.errors for r in res)
+            unchanged = sum(1 for r in res if r.unchanged)
+            secs = sum(r.seconds for r in res)
+            cancelled = any(r.cancelled for r in res)
+            bits = [f"{added:,} message{'s' if added != 1 else ''} added ({atts:,} attachments read)"]
+            if removed:
+                bits.append(f"{removed:,} removed")
+            if unchanged:
+                bits.append(f"{unchanged} mailbox{'es' if unchanged != 1 else ''} already up to date")
+            if errors:
+                bits.append(f"{errors} could not be read fully")
+            text = "Index " + ("stopped" if cancelled else "updated") + ": " + ", ".join(bits) + f" in {secs:.0f}s."
+            self.status_msg(text, "Warn.TLabel" if cancelled or errors else "Good.TLabel")
+            if then_search and not cancelled:
+                self.index_var.set(True)
+                self._index_mode_changed()
+                self._schedule_search()
+            elif self.index_var.get():
+                self._schedule_search()
+
+        names = ", ".join(t.name for t in targets[:3]) + ("…" if len(targets) > 3 else "")
+        self._run_bg(work, done, f"Indexing {names}…")
+
+    def show_index_stats(self):
+        ix = self._get_indexer()
+        if ix is None:
+            return
+        try:
+            st = ix.stats()
+            srcs = ix.sources()
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror(APP, f"The index could not be read: {exc}")
+            return
+        lines = [f"Index file: {st['path']}  ({human_size(st['bytes'])})",
+                 f"{st['sources']} mailbox{'es' if st['sources'] != 1 else ''}, {st['messages']:,} messages, "
+                 f"{st['attachments']:,} attachments ({st['messages_with_attachment_text']:,} messages with searchable attachment text)",
+                 f"PDF text: {st['pdf_engine']}" + ("" if st['pdf_engine'] != "built-in" else
+                                                     "  (install PyMuPDF for scanned-layout and complex PDFs)"), ""]
+        open_paths = {os.path.normcase(os.path.abspath(f.path)) for f in self.files}
+        for r in srcs:
+            flag = "open" if os.path.normcase(os.path.abspath(r["path"])) in open_paths else ("missing" if not os.path.exists(r["path"]) else "")
+            state = "" if r["complete"] else "  (partial - indexing was stopped)"
+            lines.append(f"• {r['name']}  [{r['kind']}]  {r['messages']:,} messages{state}" + (f"  - {flag}" if flag else ""))
+            lines.append(f"    {r['path']}")
+        if not srcs:
+            lines.append("Nothing has been indexed yet.")
+        win = tk.Toplevel(self.root)
+        win.title("What is indexed")
+        win.geometry("760x480")
+        win.configure(bg=self.c["bg"])
+        txt = tk.Text(win, wrap="word", padx=16, pady=14, relief="flat", background=self.c["panel"],
+                      foreground=self.c["text"], selectbackground=self.c["sel"], selectforeground=self.c["text"],
+                      highlightthickness=0, font=(self.ui, 10))
+        sb = ttk.Scrollbar(win, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        txt.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        txt.insert("end", "\n".join(lines))
+        txt.configure(state="disabled")
+
+    def show_index_syntax(self):
+        messagebox.showinfo("Search syntax", INDEX_SYNTAX)
+
+    def unindex_selected(self):
+        if self._busy_with_export():
+            return
+        sel = self.tree.selection()
+        pst = self.file_of_item.get(sel[0]) if sel else None
+        if pst is None:
+            messagebox.showinfo(APP, "Select a mailbox in the left pane first.")
+            return
+        ix = self._get_indexer()
+        if ix is None:
+            return
+        n = ix.remove_source(pst.path)
+        self.status_msg(f"{pst.name}: {n:,} messages taken out of the index." if n else f"{pst.name} was not in the index.")
+        if self.index_var.get():
+            self._schedule_search()
+
+    def prune_index(self):
+        if self._busy_with_export():
+            return
+        ix = self._get_indexer()
+        if ix is None:
+            return
+        gone = ix.prune_missing()
+        self.status_msg(f"Forgot {len(gone)} mailbox{'es' if len(gone) != 1 else ''} whose files are gone."
+                        if gone else "Every indexed mailbox is still where it was.")
+        if self.index_var.get():
+            self._schedule_search()
+
+    def clear_index(self):
+        if self._busy_with_export():
+            return
+        ix = self._get_indexer()
+        if ix is None:
+            # an unreadable index file: offer to delete it outright
+            path = default_db_path(self.settings)
+            if os.path.exists(path) and messagebox.askyesno(APP, f"Delete the index file?\n{path}"):
+                for suffix in ("", "-wal", "-shm"):
+                    try:
+                        os.remove(path + suffix)
+                    except OSError:
+                        pass
+                self.status_msg("Index file deleted.", "Good.TLabel")
+            return
+        st = ix.stats()
+        if not messagebox.askyesno(APP, f"Clear the whole index?\n\n{st['messages']:,} messages from {st['sources']} "
+                                        f"mailbox{'es' if st['sources'] != 1 else ''} will have to be indexed again."):
+            return
+        ix.clear()
+        self._index_mode_changed()
+        if self.index_var.get():
+            self.index_var.set(False)
+            self._index_mode_changed()
+            self._show_rows(self._filtered(self.current_rows))
+        self.status_msg("Index cleared.", "Good.TLabel")
+
+    def choose_index_location(self):
+        if self._busy_with_export():
+            return
+        current = default_db_path(self.settings)
+        path = filedialog.asksaveasfilename(title="Where to keep the content index", initialdir=os.path.dirname(current),
+                                            initialfile=os.path.basename(current), defaultextension=".db",
+                                            filetypes=[("Mailex index", "*.db"), ("All files", "*.*")],
+                                            confirmoverwrite=False)
+        if not path:
+            return
+        if os.path.normcase(os.path.abspath(path)) == os.path.normcase(os.path.abspath(current)):
+            return
+        if self._indexer is not None:
+            self._indexer.close()
+            self._indexer = None
+        self.settings["index_path"] = path
+        self._save_settings()
+        if self._get_indexer() is None:
+            self.settings.pop("index_path", None)
+            self._save_settings()
+            return
+        exists = os.path.exists(path)
+        self.status_msg(f"The index now lives at {path}." + ("" if exists else "  It is empty: use Index > Index the open mailboxes now."),
+                        "Good.TLabel")
+        if self.index_var.get():
+            self._schedule_search()
+
     # ------------------------------------------------------------- extras
     def show_inspector(self):
         msg = self.current_message
@@ -1401,6 +1769,20 @@ GUIDE = [
                 "Contacts, Outlook or Google; in every other format contacts also get their .vcf written alongside. "
                 "Every export writes an index.csv and index.json listing what was written, and export-log.txt if "
                 "anything went wrong."),
+    ("Content index", "Index > Index the open mailboxes now reads every message once - subject, people, the full "
+                      "text and the contents of attachments (Word, Excel, PowerPoint, OpenDocument, PDF, RTF, HTML, "
+                      "text, saved .eml / .msg messages, ZIP archives, and the readable strings of old .doc / .xls "
+                      "files) - into a small SQLite database beside the app. Tick 'Search index' in the filter row "
+                      "(Ctrl+Shift+F) and the search box then finds words anywhere in that index, instantly, across every "
+                      "indexed mailbox - not just the folder you are looking at. Hits list like any other messages: "
+                      "preview, select, drag out or export them. The 'Matched text' column shows where the words were "
+                      "found. Mailboxes that are not open are opened for you when a hit comes from them. Indexing is "
+                      "incremental: a file that has not changed is skipped, and only new messages are read from one that "
+                      "has. Turn on 'Index mailboxes automatically when they are opened' to keep it current. Index > "
+                      "Search syntax lists the prefixes (from:, to:, subject:, att:, in:, after:, before:, has:att, "
+                      "quotes for phrases, ! to exclude). PDFs are read with the built-in reader; the optional PyMuPDF "
+                      "package (installed by the build scripts when available) handles complex layouts better. Scanned "
+                      "images are not OCR'd."),
     ("Statistics", "View > Statistics (Ctrl+T) sums up the listed folder or everything open: messages per year and "
                    "month, top senders and sender domains, per-folder counts and sizes, the largest messages, "
                    "read/unread, item kinds, and attachment counts once the attachment lists have been read. Save "
@@ -1417,6 +1799,24 @@ GUIDE = [
     ("Where files go", "Exports go to your Downloads folder unless you choose another location in the export "
                        "dialog, or set a default under File > Default save folder."),
 ]
+
+
+INDEX_SYNTAX = (
+    "Words match anywhere - subject, people, message text and attachment contents.\n"
+    "The last word you are typing matches as a prefix.\n\n"
+    "   invoice 2023             every word, in any field\n"
+    "   \"exact phrase\"           words in that order\n"
+    "   from:bob   to:alice      sender / recipients (name or address)\n"
+    "   subject:renewal          one field only: subject, body, from, to\n"
+    "   att:pdf   att:\"q4 report\"  attachment names and their contents\n"
+    "   file:xlsx                attachment names only\n"
+    "   in:inbox                 folder path contains\n"
+    "   source:work.pst          mailbox name or path contains\n"
+    "   has:att                  only messages with attachments\n"
+    "   after:2023-06  before:2024   date window (year, year-month or full date)\n"
+    "   !spam   -newsletter      must not contain\n\n"
+    "The From / To dates, 'Has attachments', attachment kind and 'Contacts' filters still narrow the hits."
+)
 
 
 def _count_folders(src: MailSource):
@@ -1737,16 +2137,17 @@ class StatsWindow(tk.Toplevel):
 
 
 class ProgressWindow(tk.Toplevel):
-    def __init__(self, app: App, total: int, cancel: threading.Event):
+    def __init__(self, app: App, total: int, cancel: threading.Event, verb: str = "Exporting"):
         super().__init__(app.root)
         self.cancel = cancel
-        self.title("Exporting…")
+        self.verb = verb
+        self.title(f"{verb}…")
         self.configure(bg=app.c["bg"])
         self.resizable(False, False)
         self.transient(app.root)
         body = ttk.Frame(self, padding=18)
         body.pack(fill="both", expand=True)
-        self.label = ttk.Label(body, text=f"Exporting 0 of {total}…", width=70)
+        self.label = ttk.Label(body, text=f"{verb} 0 of {total}…", width=70)
         self.label.pack(anchor="w")
         self.bar = ttk.Progressbar(body, length=520, mode="determinate", maximum=max(1, total))
         self.bar.pack(fill="x", pady=(8, 8))
@@ -1771,7 +2172,7 @@ class ProgressWindow(tk.Toplevel):
     def update_progress(self, i: int, n: int, label: str):
         try:
             self.bar.configure(value=i, maximum=max(1, n))
-            self.label.configure(text=f"Exporting {i} of {n}…")
+            self.label.configure(text=f"{self.verb} {i} of {n}…" if n else f"{self.verb}…")
             self.detail.configure(text=(label or "")[:90])
         except tk.TclError:
             pass

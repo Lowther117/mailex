@@ -23,5 +23,7 @@ if [ ! -x "$VENV/bin/python" ]; then
   "$PY" -m venv "$VENV" || { echo "Could not create the environment."; read -r; exit 1; }
   "$VENV/bin/python" -m pip install --upgrade pip >/dev/null
   "$VENV/bin/python" -m pip install --only-binary :all: -r requirements.txt || { read -r; exit 1; }
+  # optional, better PDF text for the index; fine if there is no wheel
+  "$VENV/bin/python" -m pip install --only-binary :all: -r requirements-optional.txt >/dev/null 2>&1 || true
 fi
 exec "$VENV/bin/python" mailex.py "$@"

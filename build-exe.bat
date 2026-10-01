@@ -36,12 +36,23 @@ echo [3/6] Installing dependencies (wheels only, no compiling)...
 if errorlevel 1 goto :fail
 "%VPY%" -m pip install --only-binary :all: pyinstaller >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
+REM  Optional: PyMuPDF reads complex PDFs better for the content index. No wheel
+REM  for this Python is not an error - the built-in PDF reader takes over.
+set "PDF_EXTRA="
+"%VPY%" -m pip install --only-binary :all: -r "%~dp0requirements-optional.txt" >> "%LOG%" 2>&1
+"%VPY%" -c "import pymupdf" >> "%LOG%" 2>&1
+if errorlevel 1 (
+  echo       PyMuPDF has no wheel for this Python - PDFs will use the built-in reader.
+) else (
+  echo       PyMuPDF installed ^(better PDF text for the index^).
+  set "PDF_EXTRA=--collect-all pymupdf --hidden-import fitz"
+)
 
 echo [4/6] Checking the code before packaging...
 REM  The working directory is already this folder, so '.' is the source tree.
 REM  %~dp0 must NOT go inside the Python string: it always ends in a backslash,
 REM  which would escape the closing quote and make it an unterminated literal.
-"%VPY%" -c "import sys; sys.path.insert(0,'.'); import mailexlib.ui, mailexlib.export, mailexlib.pdfout; print('imports ok')" >> "%LOG%" 2>&1
+"%VPY%" -c "import sys; sys.path.insert(0,'.'); import mailexlib.ui, mailexlib.export, mailexlib.pdfout, mailexlib.indexer; print('imports ok')" >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
 echo [5/6] Packaging (this takes a minute or two)...
@@ -57,7 +68,9 @@ if exist "%~dp0dist" rmdir /s /q "%~dp0dist"
   --hidden-import tkinter.ttk ^
   --hidden-import tkinter.filedialog ^
   --hidden-import tkinter.messagebox ^
+  --hidden-import sqlite3 ^
   --exclude-module pytest ^
+  %PDF_EXTRA% ^
   "%~dp0mailex_app.py" >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 if not exist "%~dp0dist\Mailex.exe" goto :fail

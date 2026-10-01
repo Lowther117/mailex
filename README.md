@@ -8,7 +8,10 @@ installed. Point it at one file or at a folder full of them, browse and preview,
 then export what you select - a handful of messages or an entire mailbox - as
 **EML**, **MBOX**, **PDF**, **HTML**, **plain text**, **vCard** for the
 contacts, or just the **attachments**. Or drag messages straight out of the
-list into a folder. Windows and macOS, one window, dark mode by default.
+list into a folder. A **content index** makes every message *and every
+attachment* - Word, Excel, PowerPoint, PDF, ZIP and the rest - searchable in
+milliseconds across all your mailboxes at once. Windows and macOS, one window,
+dark mode by default.
 
 The PST/OST reader and the compound-file reader behind `.msg` are written from
 scratch in Python from Microsoft's published specifications ([MS-PST],
@@ -31,7 +34,7 @@ files you open are only ever read; not a byte of them is changed.
 | `run.bat` | Windows, run from source without building an exe. Sets up a virtual environment the first time. |
 | `run.command` | macOS, run from source without building an app. |
 | `python mailex.py` | Any platform, if you already have Python 3.9+ with tkinter and the requirements installed (`pip install -r requirements.txt`; `tkinterdnd2` is optional - without it everything works except drag and drop). |
-| `Mailex selftest` | Builds synthetic mailboxes in every supported format, reads them back and exports every output format, then writes `mailex-selftest.txt`. The build scripts run this and refuse to claim success if anything fails. |
+| `Mailex selftest` | Builds synthetic mailboxes in every supported format, reads them back, exports every output format, indexes and searches them, then writes `mailex-selftest.txt`. The build scripts run this and refuse to claim success if anything fails. |
 
 The repository is deliberately flat - no Windows/Mac subfolders. The extension
 already says which operating system a file is for.
@@ -172,6 +175,63 @@ else, or set a default under *File > Default save folder*.
   export from.
 - Ctrl+D switches between dark and light.
 
+### The content index
+
+The filter row searches the listing you are looking at. The **index** searches
+everything: the full text of every message in every mailbox you have indexed,
+and the contents of their attachments - like [Findex](https://github.com/Lowther117/findex)
+does for files on disk, with the same query syntax.
+
+- **Index > Index the open mailboxes now** (Ctrl+Shift+I) reads each message
+  once - subject, people, body, and every attachment it can get text out of:
+  Word/Excel/PowerPoint (`.docx`/`.xlsx`/`.pptx`), OpenDocument, **PDF**, RTF,
+  HTML and plain text, saved `.eml`/`.msg` messages, the members of **ZIP**
+  archives one level down, and the readable strings of old binary `.doc`/`.xls`
+  files. Forwarded (embedded) messages are indexed to any depth. It all goes
+  into one SQLite FTS5 database, `mailex-index.db`, beside the app (or wherever
+  *Index location…* points). A progress window shows where it is and Cancel
+  keeps what has been done so far.
+- **Incremental.** A mailbox whose size and modification time have not changed
+  is skipped outright; one that has changed only has its *new* messages read,
+  and messages that have vanished are dropped. Tick *Index mailboxes
+  automatically when they are opened* and the index keeps itself current.
+- **Search index** in the filter row (Ctrl+Shift+F) switches the search box to
+  the index. Results arrive as you type, the last word matching as a prefix,
+  ranked by relevance with subject matches first. They list like any other
+  messages - preview, select, drag out, export, statistics all work on them -
+  and a *Matched text* column shows where the words were found: `body:`,
+  `attachment:`, `subject:`, `sender:`, with the matched words in [brackets].
+  A hit from a mailbox that is not open opens it for you. The date, attachment
+  and contact filters still narrow the hits; clicking a folder returns to the
+  normal listing.
+- **Query syntax** (Index > Search syntax…):
+
+  | | |
+  |---|---|
+  | `invoice 2023` | every word, in any field |
+  | `"exact phrase"` | words in that order |
+  | `from:bob` `to:alice` | sender / recipients (name or address) |
+  | `subject:renewal` `body:total` | one field only |
+  | `att:pdf` `att:"q4 report"` | attachment names **and contents** |
+  | `file:xlsx` | attachment names only |
+  | `in:inbox` `source:work.pst` | folder path / mailbox contains |
+  | `has:att` | only messages with attachments |
+  | `after:2023-06` `before:2024` | date window (year, year-month or full date) |
+  | `!spam` `-newsletter` | must not contain |
+
+  Accents are folded (`cafe` finds *café*), matching is case-insensitive, and
+  the index tokeniser is Unicode-aware, so non-Latin text is searchable too.
+- **PDFs** are read with a built-in reader that handles the text streams of
+  normal PDFs (Flate / ASCII85 / ASCIIHex encoded, literal and hex strings).
+  The optional **PyMuPDF** package does much better on complex layouts and
+  subset-font PDFs; the build and run scripts install it when a wheel exists
+  for the Python in use and carry on without it when not (`Index > What is
+  indexed…` says which reader is in use). Scanned images are not OCR'd.
+- **Index > What is indexed…** lists every mailbox in the index with its
+  message count and whether it is open, missing or partially indexed; *Take the
+  selected mailbox out of the index*, *Forget mailboxes whose files are gone*
+  and *Clear the whole index…* do what they say.
+
 ---
 
 ## Command line
@@ -189,6 +249,9 @@ Mailex export SOURCE... [-f eml|mbox|pdf|html|txt|attachments|vcf] [-o DIR]
 Mailex stats SOURCE... [--folder PATH] [--csv DIR] [--html FILE] [--quick]
 Mailex list SOURCE...          folder tree with message counts
 Mailex info SOURCE...          what kind of mailbox it is
+Mailex index SOURCE... [--force] [--db FILE]        add mailboxes to the content index
+Mailex index [--stats] [--prune] [--clear] [--remove SOURCE...]
+Mailex find QUERY [-n N] [--json] [--export DIR -f FMT]   search the index, optionally export the hits
 Mailex selftest [FILE]         self-test, optionally exercising a real file too
 ```
 
@@ -201,8 +264,13 @@ text (which means opening every message, so it is slower); `--attachment-type`
 opens the messages that have attachments to look at their names, and with
 `-f attachments` also limits which files are saved. `stats` prints the same
 tables the window shows and opens the messages with attachments for their
-counts and sizes unless `--quick` is given. From source, `python mailex.py`
-takes the same arguments.
+counts and sizes unless `--quick` is given. `index` and `find` use the same
+index file as the window (or `--db` names another), so an index built
+overnight on a server with `Mailex index /mail/*.pst` is what the window
+searches in the morning, and `Mailex find 'from:bob att:invoice after:2024'
+--export ~/hits -f pdf` pulls matching messages straight out of whichever
+mailboxes they came from. From source, `python mailex.py` takes the same
+arguments.
 
 ---
 
@@ -291,6 +359,8 @@ attachment in them opens and exports.
 | `mailexlib/contacts.py` | Contact items: MAPI properties to one shape, then vCard, CSV and readable text |
 | `mailexlib/filters.py` | The listing filters (text, body, dates, attachments, contacts) shared by window and CLI |
 | `mailexlib/stats.py` | Mailbox statistics tables and their text, CSV and HTML renderings |
+| `mailexlib/indexer.py` | The content index: SQLite FTS5 schema, incremental indexing, query parsing and search, hits back to rows |
+| `mailexlib/extract.py` | Text out of attachments: Office, OpenDocument, PDF, RTF, HTML, text, .eml/.msg, ZIP, legacy Office |
 | `mailexlib/dnd.py` | Drag and drop in both directions through tkinterdnd2, optional |
 | `mailexlib/cfb.py` | Compound file (OLE2) reader |
 | `mailexlib/msgfile.py` | Outlook .msg on top of it |
@@ -307,8 +377,9 @@ attachment in them opens and exports.
 | `mailexlib/_crypt_tables.py` | The three 256-byte cipher tables from the PST specification |
 
 Python 3.9 to 3.14. Dependencies: `reportlab` and `pillow` (for PDF output
-only) and `tkinterdnd2` (for drag and drop only, and optional) - everything
-else is the standard library.
+only), `tkinterdnd2` (for drag and drop only, and optional) and `pymupdf`
+(optional, better PDF text for the index; `requirements-optional.txt`) -
+everything else, the SQLite FTS5 index included, is the standard library.
 
 ## Licence
 

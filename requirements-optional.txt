@@ -1,0 +1,3 @@
+# Optional. Better text extraction from complex PDFs for the content index.
+# The build and run scripts try it and carry on without it when there is no wheel.
+pymupdf>=1.24

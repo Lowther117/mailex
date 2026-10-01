@@ -21,3 +21,8 @@ __pycache__/
 # os
 .DS_Store
 Thumbs.db
+
+# content index (lives beside the app)
+mailex-index.db
+mailex-index.db-wal
+mailex-index.db-shm

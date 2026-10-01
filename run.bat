@@ -17,6 +17,8 @@ if errorlevel 1 ( echo Could not create the environment. & pause & exit /b 1 )
 "%VENV%\Scripts\python.exe" -m pip install --upgrade pip >nul
 "%VENV%\Scripts\python.exe" -m pip install --only-binary :all: -r "%~dp0requirements.txt"
 if errorlevel 1 ( pause & exit /b 1 )
+REM  optional, better PDF text for the index; fine if there is no wheel
+"%VENV%\Scripts\python.exe" -m pip install --only-binary :all: -r "%~dp0requirements-optional.txt" >nul 2>&1
 
 :run
 start "" "%VENV%\Scripts\pythonw.exe" "%~dp0mailex.py" %*

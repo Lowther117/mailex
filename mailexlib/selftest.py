@@ -918,5 +918,157 @@ def _check_sources(record, tmp: str, mailbox_def):
            f"{len(out.splitlines())} lines of text")
     rc, out = run_cli("--help")
     record("CLI help mentions the new options", rc == 0 and "--search-body" in out and "--since" in out and "stats" in out
-           and "vcf" in out and "PST or OST" not in out)
+           and "vcf" in out and "PST or OST" not in out and "index" in out and "find" in out)
+
+    # -- attachment text extraction
+    import zipfile
+    from . import extract as _ex
+
+    def zipbytes(parts):
+        b = io.BytesIO()
+        with zipfile.ZipFile(b, "w") as z_:
+            for n_, c_ in parts.items():
+                z_.writestr(n_, c_)
+        return b.getvalue()
+
+    docx = zipbytes({"[Content_Types].xml": "<Types/>", "word/document.xml":
+                     '<w:document><w:body><w:p><w:r><w:t>Renewal terms for</w:t></w:r><w:r><w:t xml:space="preserve"> Acme</w:t></w:r></w:p>'
+                     '<w:p><w:r><w:t>Penalty clause zebra</w:t></w:r></w:p></w:body></w:document>'})
+    xlsx = zipbytes({"xl/sharedStrings.xml": "<sst><si><t>Widget</t></si><si><r><t>Flamingo budget</t></r></si></sst>",
+                     "xl/worksheets/sheet1.xml": '<worksheet><sheetData><row><c t="s"><v>1</v></c><c><v>4242</v></c></row></sheetData></worksheet>'})
+    pptx = zipbytes({"ppt/slides/slide1.xml": "<p:sld><a:p><a:r><a:t>Roadmap</a:t></a:r></a:p><a:p><a:r><a:t>Q4 goals</a:t></a:r></a:p></p:sld>"})
+    odt = zipbytes({"content.xml": "<office:document-content><office:body><text:p>Alpha beta</text:p><text:h>Gamma</text:h></office:body></office:document-content>"})
+    from reportlab.pdfgen import canvas as _canvas
+    pdf_buf = io.BytesIO()
+    cv = _canvas.Canvas(pdf_buf, pageCompression=1)
+    cv.drawString(72, 720, "Quarterly PDF report mentions giraffe")
+    cv.showPage()
+    cv.drawString(72, 720, "Second page (brackets) & more")
+    cv.showPage()
+    cv.save()
+    pdf_bytes = pdf_buf.getvalue()
+    got = {
+        "docx": _ex.extract("terms.docx", docx), "xlsx": _ex.extract("budget.xlsx", xlsx),
+        "pptx": _ex.extract("deck.pptx", pptx), "odt": _ex.extract("doc.odt", odt),
+        "pdf": _ex.extract("report.pdf", pdf_bytes),
+        "zip": _ex.extract("bundle.zip", zipbytes({"notes.txt": "secret phrase inside zip", "img.png": b"\x89PNG"})),
+        "rtf": _ex.extract("note.rtf", SAMPLE_RTF), "html": _ex.extract("page.html", b"<p>Para <b>one</b></p><script>x</script>"),
+        "eml": _ex.extract("saved.eml", b"Subject: inner subject\r\nFrom: a@b.c\r\n\r\ninner body text\r\n"),
+        "msg": _ex.extract("saved.msg", open(glob.glob(os.path.join(msg_dir, "*.msg"))[0], "rb").read()),
+        "junk": _ex.extract("x.pdf", os.urandom(200_000) + b"stream\n" + b"( 1 2 3 [ ] " * 20000 + b"endstream"),
+    }
+    want = {"docx": "Renewal terms for Acme\nPenalty clause zebra", "xlsx": "Widget\nFlamingo budget\n4242", "pptx": "Roadmap\nQ4 goals",
+            "odt": "Alpha beta\nGamma", "pdf": "Quarterly PDF report mentions giraffe Second page (brackets) & more",
+            "zip": "notes.txt\nsecret phrase inside zip\nimg.png", "html": "Para one"}
+    bad = [k for k, v in want.items() if got[k] != v]
+    bad += [k for k in ("rtf", "eml", "msg") if not got[k]] + (["junk"] if got["junk"] else [])
+    bad += [] if "Hello from RTF" in got["rtf"] and "inner body text" in got["eml"] and "inner subject" in got["eml"] else ["rtf/eml content"]
+    record("attachment text extraction (docx/xlsx/pptx/odf/pdf/zip/rtf/html/eml/msg)", not bad,
+           "; ".join(f"{k}={got[k][:60]!r}" for k in bad) if bad else f"PDF via {_ex.pdf_engine()}")
+
+    # -- the content index: build it over the lot, search it, keep it incremental
+    from . import indexer as _ix
+    from .export import ExportOptions as _EO, Exporter as _Ex
+    ix_dir = os.path.join(base, "index")
+    os.makedirs(ix_dir, exist_ok=True)
+    rich = synth.SynthFolder("Top of Personal Folders", subfolders=[synth.SynthFolder("Inbox", [
+        synth.SynthMessage("Attachments galore", "Carol Docs", "carol@example.com", [("Bob", "bob@example.com")],
+                           _dt.datetime(2024, 4, 14, 9, 0, tzinfo=_dt.timezone.utc), body="Three files attached.",
+                           attachments=[("terms.docx", docx, "application/octet-stream"), ("budget.xlsx", xlsx, "application/octet-stream"),
+                                        ("report.pdf", pdf_bytes, "application/pdf")]),
+        synth.SynthMessage("Plain words only", "Carol Docs", "carol@example.com", [("Bob", "bob@example.com")],
+                           _dt.datetime(2024, 4, 15, 9, 0, tzinfo=_dt.timezone.utc), body="The quick kangaroo jumps."),
+    ])])
+    rich_path = os.path.join(ix_dir, "rich.pst")
+    synth.write_pst(rich_path, [rich])
+    db = os.path.join(ix_dir, "mailex-index.db")
+    ix = _ix.Indexer(db)
+    rich_src = PSTFile(rich_path)
+    import threading
+    srcs_all = [open_found(k, p) for k, p in found]       # the mixed folder again (the pst among them)
+    res_all = ix.index_many([rich_src] + srcs_all)
+    st = ix.stats()
+    n_rows = 2 + sum(1 for s_ in srcs_all for _r in s_.all_message_rows())   # exports above added loose .eml files
+    record("index builds over every source", st["sources"] == 1 + len(srcs_all) and st["messages"] == n_rows
+           and sum(r.added for r in res_all) == n_rows and not any(r.errors for r in res_all),
+           f"{st['sources']} sources, {st['messages']} messages (expected {n_rows}), {st['attachments']} attachments")
+
+    def subjects(q, **kw):
+        return sorted({h.subject for h in ix.search(q, **kw)})
+
+    checks = {
+        "docx text": (subjects("zebra"), ["Attachments galore"]),
+        "xlsx text": (subjects("flamingo 4242"), ["Attachments galore"]),
+        "pdf text": (subjects("giraffe"), ["Attachments galore"]),
+        "att: name": (subjects("att:budget"), ["Attachments galore"]),
+        "att: content": (subjects("att:kangaroo"), []),
+        "body": (subjects("kangaroo"), ["Plain words only"]),
+        "phrase": (subjects('"quick kangaroo jumps"'), ["Plain words only"]),
+        "phrase broken": (subjects('"kangaroo quick"'), []),
+        "from:": (subjects("from:carol"), ["Attachments galore", "Plain words only"]),
+        "from: + neg": (subjects("from:carol !zebra"), ["Plain words only"]),
+        "subject:": (subjects("subject:galore"), ["Attachments galore"]),
+        "has:att": (subjects("from:carol has:att"), ["Attachments galore"]),
+        "after/before": (subjects("from:carol after:2024-04-15 before:2024-04-16"), ["Plain words only"]),
+        "in: folder": (subjects("kangaroo in:inbox"), ["Plain words only"]),
+        "in: wrong folder": (subjects("kangaroo in:sent"), []),
+        "source:": (subjects("kangaroo source:rich.pst"), ["Plain words only"]),
+        "live prefix": (subjects("kangar", live=True), ["Plain words only"]),
+        "no prefix when not live": (subjects("kangar"), []),
+        "embedded message": (subjects("embedded message body") and ["FW: with an embedded message"] <= subjects("embedded message body"), True),
+        "accents fold": (UNICODE_SUBJECT in subjects("naive cafe prufung"), True),
+    }
+    bad = [k for k, (g, w) in checks.items() if g != w]
+    record("index search syntax", not bad, "; ".join(f"{k}: {checks[k][0]}" for k in bad) if bad else f"{len(checks)} cases")
+    h = ix.search("giraffe")[0]
+    record("index hit says where it matched", h.where == "attachment" and "[giraffe]" in h.snippet and h.att_count == 3
+           and "report.pdf" in h.att_names and h.sender == "Carol Docs" and h.date is not None, f"{h.where}: {h.snippet[:70]}")
+    rs = _ix.Resolver({rich_path: rich_src})
+    row_ = rs.row_for(h)
+    rs2 = _ix.Resolver()
+    row2 = rs2.row_for(ix.search("kangaroo")[0])
+    record("index hits resolve to rows (open and auto-opened sources)", row_ is not None and row_.subject == "Attachments galore"
+           and row2 is not None and row2.subject == "Plain words only" and len(rs2.auto_opened) == 1 and not rs2.errors,
+           str(rs2.errors))
+    rs2.close_auto_opened()
+    mbox_hit = [x for x in ix.search("has:att", limit=5000) if x.source_kind != "pst"][:6]
+    rs3 = _ix.Resolver()
+    pairs = rs3.rows_for(mbox_hit)
+    ex_out = os.path.join(ix_dir, "export")
+    res = _Ex(_EO(fmt="eml", out_dir=ex_out), lambda i, n, l: None).run([r for _h, r in pairs])
+    record("index hits from MIME sources export", bool(mbox_hit) and len(pairs) == len(mbox_hit) and res.exported == len(pairs)
+           and not res.failed, f"{len(mbox_hit)} hits, {res.exported} exported")
+    rs3.close_auto_opened()
+    r1 = ix.index_source(rich_src)
+    os.utime(rich_path, None)
+    r2 = ix.index_source(rich_src)
+    rich.subfolders[0].messages.pop()        # the kangaroo message goes away
+    rich_src.close()
+    synth.write_pst(rich_path, [rich])
+    rich_src = PSTFile(rich_path)
+    r3 = ix.index_source(rich_src)
+    record("index is incremental (unchanged skip, touched = per-message skip, removal)",
+           r1.unchanged and r2.added == 0 and r2.skipped == 2 and not r2.unchanged and r3.removed >= 1 and not subjects("kangaroo")
+           and subjects("giraffe") == ["Attachments galore"], f"{r1.summary} | {r2.summary} | {r3.summary}")
+    ev = threading.Event()
+    ev.set()
+    r4 = ix.index_source(rich_src, cancel=ev, force=True)
+    r5 = ix.index_source(rich_src)
+    record("index cancel leaves a resumable partial", r4.cancelled and r4.added == 0 and r5.added == 1 and ix.is_current(rich_path),
+           f"{r4.summary} | {r5.summary}")
+    n_removed = ix.remove_source(pst_path)
+    gone = ix.prune_missing()
+    record("index remove / prune", n_removed == n_all and gone == [] and ix.stats()["sources"] == len(srcs_all),
+           f"removed {n_removed}, pruned {gone}")
+    ix.close()
+    rich_src.close()
+    for s_ in srcs_all:
+        s_.close()
+    rc, out = run_cli("index", "--db", db, rich_path, "--force")
+    rc2, out2 = run_cli("find", "--db", db, "giraffe")
+    rc3, out3 = run_cli("find", "--db", db, "zebra", "--export", os.path.join(ix_dir, "cli-export"), "-f", "txt")
+    rc4, out4 = run_cli("index", "--db", db, "--stats")
+    record("CLI index / find / find --export", rc == 0 and "1 added" in out and rc2 == 0 and "Attachments galore" in out2
+           and "[attachment]" in out2 and rc3 == 0 and "1 message exported" in out3 and rc4 == 0 and "rich.pst" in out4,
+           (out + out2 + out3 + out4).strip().splitlines()[-1][:100] if (out + out2 + out3 + out4).strip() else "no output")
     pst.close()
