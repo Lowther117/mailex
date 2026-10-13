@@ -11,7 +11,7 @@ contacts, or just the **attachments**. Or drag messages straight out of the
 list into a folder. A **content index** makes every message *and every
 attachment* - Word, Excel, PowerPoint, PDF, ZIP and the rest - searchable in
 milliseconds across all your mailboxes at once. Windows and macOS, one window,
-dark mode by default.
+Phosphor purple theme by default (the same look as Winnow).
 
 The PST/OST reader and the compound-file reader behind `.msg` are written from
 scratch in Python from Microsoft's published specifications ([MS-PST],
@@ -173,7 +173,7 @@ else, or set a default under *File > Default save folder*.
   for messages that no folder lists any more - things that were deleted but
   whose data is still in the file - and adds them as a pseudo-folder you can
   export from.
-- Ctrl+D switches between dark and light.
+- Ctrl+D cycles the theme: Phosphor purple (the default, same look as Winnow) → Dark → Light.
 
 ### The content index
 
@@ -369,7 +369,7 @@ attachment in them opens and exports.
 | `mailexlib/export.py` | EML, MBOX, HTML, text and attachment exporters; the bulk runner |
 | `mailexlib/pdfout.py` | PDF rendering (ReportLab) |
 | `mailexlib/ui.py` | The window |
-| `mailexlib/theme.py` | Shared light/dark theme (identical across all of my apps) |
+| `mailexlib/theme.py` | Shared house theme - Phosphor purple, Dark and Light (identical across all of my apps) |
 | `mailexlib/paths.py` | App folder, settings, default save folder |
 | `mailexlib/synth.py` | Test-only PST and compound-file writers |
 | `mailexlib/selftest.py` | The self-test |

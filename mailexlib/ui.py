@@ -33,8 +33,9 @@ class App(ttk.Frame):
         super().__init__(root)
         self.root = root
         self.settings = load_settings()
-        self.dark = bool(self.settings.get("dark", True))
-        self.c = theme.apply(root, self.dark)
+        self.theme_name = theme.from_settings(self.settings)   # phosphor purple by default
+        self.dark = theme.is_dark(self.theme_name)
+        self.c = theme.apply(root, self.theme_name)
         self.ui = theme.ui_family(root)
         self.mono = theme.mono_family(root)
         self.q: "queue.Queue" = queue.Queue()
@@ -117,7 +118,7 @@ class App(ttk.Frame):
             self.settings["vsash"] = self.vpane.sashpos(0)
         except Exception:  # noqa: BLE001
             pass
-        self.settings.update(dark=self.dark, geometry=self.root.geometry(),
+        self.settings.update(theme=self.theme_name, dark=self.dark, geometry=self.root.geometry(),
                              include_subfolders=bool(self.include_sub.get()),
                              only_mail=bool(self.only_mail.get()), auto_index=bool(self.auto_index.get()))
         save_settings(self.settings)
@@ -186,7 +187,7 @@ class App(ttk.Frame):
         e.add_command(label="Save this message as .eml…", command=self.save_current_eml)
         m.add_cascade(label="Export", menu=e)
         v = tk.Menu(m, tearoff=0)
-        v.add_command(label="Toggle light / dark", accelerator="Ctrl+D", command=self.toggle_theme)
+        v.add_command(label="Next theme (Phosphor / Dark / Light)", accelerator="Ctrl+D", command=self.toggle_theme)
         v.add_checkbutton(label="Include subfolders in the list", variable=self.include_sub, command=self._refresh_list)
         v.add_checkbutton(label="Only show e-mail items (hide calendar, contacts, tasks)", variable=self.only_mail,
                           command=self._refresh_list)
@@ -251,7 +252,7 @@ class App(ttk.Frame):
         ttk.Button(bar, text="Export selected…", command=lambda: self.export_dialog("selected")).pack(side="left")
         ttk.Button(bar, text="Export folder…", command=lambda: self.export_dialog("folder")).pack(side="left", padx=(6, 0))
         ttk.Button(bar, text="Export everything…", command=lambda: self.export_dialog("all")).pack(side="left", padx=(6, 0))
-        self.theme_btn = ttk.Button(bar, text="Light" if self.dark else "Dark", width=6, command=self.toggle_theme)
+        self.theme_btn = ttk.Button(bar, text=theme.short_label(theme.next_theme(self.theme_name)), width=9, command=self.toggle_theme)
         self.theme_btn.pack(side="right")
         ttk.Checkbutton(bar, text="Subfolders", variable=self.include_sub, command=self._refresh_list).pack(side="right", padx=(0, 12))
         ttk.Checkbutton(bar, text="E-mail only", variable=self.only_mail, command=self._mail_only_toggled).pack(side="right", padx=(0, 8))
@@ -443,9 +444,10 @@ class App(ttk.Frame):
                 self._inspector = None
 
     def toggle_theme(self):
-        self.dark = not self.dark
-        self.c = theme.apply(self.root, self.dark)
-        self.theme_btn.configure(text="Light" if self.dark else "Dark")
+        self.theme_name = theme.next_theme(self.theme_name)
+        self.dark = theme.is_dark(self.theme_name)
+        self.c = theme.apply(self.root, self.theme_name)
+        self.theme_btn.configure(text=theme.short_label(theme.next_theme(self.theme_name)))
         self._recolour()
 
     # -------------------------------------------------------- mouse wheel
