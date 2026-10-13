@@ -55,7 +55,7 @@ executable bit and quarantine flag sorted once, from inside the folder:
 | Source | How Mailex sees it |
 |---|---|
 | **PST / OST** | Outlook data files. Its folder tree, message counts and all. Both encryption modes are undone transparently; a PST *password* only guards Outlook's own UI, so password-protected files open normally. |
-| **MBOX** file | One folder of messages. Any of the mbox flavours (mboxo, mboxrd, mboxcl) that mail clients write. |
+| **MBOX** file | One folder of messages. Any of the mbox flavours (mboxo, mboxrd, mboxcl/mboxcl2 - a believable `Content-Length` is honoured) that mail clients write. |
 | **Thunderbird** | Point *Open folder* at a profile's `Mail` or `ImapMail` folder (or one account inside it): each extensionless mbox file becomes a folder, `Name.sbd` directories become its sub-folders, `.msf` index files are ignored. |
 | **Apple Mail export** | An exported `Name.mbox` package (the folder with an `mbox` file inside) opens as one folder. A folder of them opens as one source with a folder each. |
 | **Maildir** | A directory with `cur`, `new` and `tmp`. Courier-style `.Folder.Sub` sub-directories and plainly nested Maildirs both become sub-folders; read/unread comes from the file flags. |
@@ -122,7 +122,7 @@ simply behaves as before - `pip install tkinterdnd2` turns it on.
 | Format | What you get |
 |---|---|
 | **EML** | One `.eml` per message. Messages that arrived as real RFC 822 bytes (MBOX, EML, Maildir) are written out **byte for byte**. PST and MSG messages are rebuilt into standards-compliant MIME: the original transport headers where the file kept them, text and HTML bodies, attachments embedded, inline images wired up by Content-ID, forwarded messages nested as `message/rfc822`. Opens in Outlook, Apple Mail, Thunderbird, and anything else that reads mail. |
-| **MBOX** | One mailbox file per folder (or one for the lot), for importing into Thunderbird or Apple Mail. Same passthrough rule as EML. |
+| **MBOX** | One mailbox file per folder (or one for the lot), for importing into Thunderbird or Apple Mail. Same passthrough rule as EML. An existing `.mbox` is never appended to: exporting again into the same place writes `Name (2).mbox`. |
 | **PDF** | One PDF per message with a header block and the body text, or - tick the option - every message in one combined PDF with a page per message. A system font with wide Unicode coverage is used when one is present (Segoe UI or Arial on Windows, Arial Unicode on macOS), so accented and most non-Latin text prints as text (CJK needs a font that has it - Arial Unicode on a Mac does, Segoe UI on Windows does not). Attachments are saved in a folder beside each PDF. |
 | **HTML** | A standalone web page per message: header table, the original HTML body with inline images embedded as data URIs (so the page works on its own), links to the attachments saved beside it. |
 | **Plain text** | Headers and body text, attachments saved beside it. Bodies that only exist as HTML or RTF are converted. |

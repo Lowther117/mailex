@@ -30,7 +30,7 @@ function Find-Python {
   # py launcher first: it knows about every installed version
   $py = (Get-Command py -ErrorAction SilentlyContinue)
   if ($py) {
-    foreach ($v in @("-3.13","-3.12","-3.11","-3.10","-3.9","-3")) {
+    foreach ($v in @("-3.14","-3.13","-3.12","-3.11","-3.10","-3.9","-3")) {
       try {
         $p = & py $v -c "import sys;print(sys.executable)" 2>$null
         if (Test-RealPython $p) { return $p }

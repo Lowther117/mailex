@@ -197,6 +197,8 @@ class NDB:
         hdr = self._read_at(0, 564 if self.size >= 564 else self.size)
         if hdr[:4] != MAGIC:
             raise PSTError("not a PST/OST file (missing !BDN signature)")
+        if len(hdr) < 14:
+            raise PSTError("the file is too short to be a PST/OST (header cut off)")
         self.client_sig = hdr[8:10]
         (self.ver, self.ver_client) = struct.unpack_from("<HH", hdr, 10)
         if self.ver in (14, 15):
@@ -207,6 +209,8 @@ class NDB:
             self.fmt = FMT_UNICODE4K
         else:
             raise PSTUnsupported(f"unknown NDB version {self.ver}")
+        if len(hdr) < (512 if self.fmt == FMT_ANSI else 564):
+            raise PSTError("the file is too short to be a PST/OST (header cut off)")
 
         if self.fmt == FMT_ANSI:
             self.idsize = 4

@@ -1176,8 +1176,12 @@ class App(ttk.Frame):
                                             initialdir=default_save_dir(self.settings))
         if not path:
             return
-        with open(path, "wb") as fh:
-            fh.write(data)
+        try:
+            with open(path, "wb") as fh:
+                fh.write(data)
+        except Exception as exc:  # noqa: BLE001 - read-only folder, disk full, file in use...
+            messagebox.showerror(APP, f"Could not save {os.path.basename(path)}:\n{exc}")
+            return
         self.status_msg(f"Saved {os.path.basename(path)} ({human_size(len(data))}).", "Good.TLabel")
 
     def save_current_eml(self):
@@ -1198,8 +1202,13 @@ class App(ttk.Frame):
                                             initialdir=default_save_dir(self.settings))
         if not path:
             return
-        with open(path, "wb") as fh:
-            fh.write(eml_bytes(msg))
+        try:
+            data = eml_bytes(msg)
+            with open(path, "wb") as fh:
+                fh.write(data)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror(APP, f"Could not save {os.path.basename(path)}:\n{exc}")
+            return
         self.status_msg(f"Saved {os.path.basename(path)}.", "Good.TLabel")
 
     def save_selected_attachments(self):
@@ -1652,22 +1661,8 @@ class App(ttk.Frame):
             return
 
         def work():
-            from . import mapi
-            nids = pst.orphan_messages()
-            folder = Folder(pst, 0, "(orphaned messages)", pst.root)
-            rows = []
-            for nid in nids:
-                try:
-                    m = pst.message(nid, folder=folder)
-                    rows.append(MessageRow(folder, {mapi.PR_LTP_ROW_ID: nid, mapi.PR_SUBJECT: m.subject,
-                                                    mapi.PR_SENDER_NAME: m.sender, mapi.PR_MESSAGE_DELIVERY_TIME: m.date,
-                                                    mapi.PR_MESSAGE_SIZE: m.size, mapi.PR_HASATTACH: m.has_attachments,
-                                                    mapi.PR_MESSAGE_CLASS: m.message_class, mapi.PR_DISPLAY_TO: m.display_to}))
-                except Exception:  # noqa: BLE001
-                    continue
-            folder._rows = rows
-            folder._subfolders = []
-            folder.content_count = len(rows)
+            rows = pst.orphan_rows()
+            folder = rows[0].folder if rows else None
             return folder, rows
 
         def done(res):
@@ -1894,6 +1889,9 @@ class ExportDialog(tk.Toplevel):
         self.cb_mirror.grid(row=r, column=1, columnspan=2, sticky="w", pady=(8, 1)); r += 1
         self.cb_atts = ttk.Checkbutton(body, text="Include attachments (embedded in EML / MBOX; saved beside PDF, HTML and text)", variable=self.atts)
         self.cb_atts.grid(row=r, column=1, columnspan=2, sticky="w", pady=1); r += 1
+        ttk.Label(body, text="Unticked, messages from MBOX / EML / Maildir sources are rebuilt as new MIME "
+                             "messages instead of being copied byte-for-byte.", style="Dim.TLabel"
+                  ).grid(row=r, column=1, columnspan=2, sticky="w", padx=(22, 0), pady=(0, 2)); r += 1
         self.cb_single = ttk.Checkbutton(body, text="PDF: put every message in ONE combined PDF instead of one file each", variable=self.single_pdf)
         self.cb_single.grid(row=r, column=1, columnspan=2, sticky="w", pady=1); r += 1
         self.cb_vcard = ttk.Checkbutton(body, text="Contacts: also write a .vcf beside each contact, plus contacts.vcf and contacts.csv at the top",
@@ -2121,7 +2119,11 @@ class StatsWindow(tk.Toplevel):
         d = filedialog.askdirectory(title="Save one CSV per table into", initialdir=default_save_dir(self.app.settings), parent=self)
         if not d:
             return
-        paths = _stats.write_csv_dir(self.stats, d)
+        try:
+            paths = _stats.write_csv_dir(self.stats, d)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror(APP, f"Could not write the CSV files:\n{exc}", parent=self)
+            return
         self.status.configure(text=f"{len(paths)} CSV files written to {d}")
 
     def _save_html(self):
@@ -2133,8 +2135,12 @@ class StatsWindow(tk.Toplevel):
                                             initialdir=default_save_dir(self.app.settings), parent=self)
         if not path:
             return
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(_stats.render_html(self.stats))
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(_stats.render_html(self.stats))
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror(APP, f"Could not save {os.path.basename(path)}:\n{exc}", parent=self)
+            return
         self.status.configure(text=f"Saved {os.path.basename(path)}")
 
 

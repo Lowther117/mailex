@@ -1,6 +1,7 @@
 """Lists, Tables and Properties layer: heap-on-node, BTH, property and table contexts."""
 from __future__ import annotations
 
+import bisect
 import struct
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -300,11 +301,8 @@ class TableContext:
         for rid, idx in index:
             if idx >= total:
                 continue
-            # locate chunk
-            ci = 0
-            for ci in range(len(chunks) - 1, -1, -1):
-                if starts[ci] <= idx:
-                    break
+            # locate chunk: the last one starting at or before idx
+            ci = max(bisect.bisect_right(starts, idx) - 1, 0)
             local = idx - starts[ci]
             chunk = chunks[ci]
             row = chunk[local * rs:(local + 1) * rs]

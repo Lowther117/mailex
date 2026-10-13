@@ -463,6 +463,15 @@ def _with_db(fn):
         self._enter()
         try:
             return fn(self, *args, **kwargs)
+        except BaseException:
+            # never hand a connection with a half-done write back to the pool
+            c = getattr(self._local, "conn", None)
+            if c is not None and getattr(self._local, "depth", 1) == 1 and c.in_transaction:
+                try:
+                    c.rollback()
+                except sqlite3.Error:
+                    pass
+            raise
         finally:
             self._leave()
     return wrapper
@@ -689,9 +698,8 @@ class Indexer:
             res.notes.append(f"listing stopped: {exc}")
         # orphans (PST messages whose folder is gone) are still searchable
         try:
-            if hasattr(source, "orphan_messages"):
-                for r in source.orphan_messages():
-                    rows.append(r)
+            if hasattr(source, "orphan_rows"):
+                rows.extend(source.orphan_rows())
         except Exception:  # noqa: BLE001
             pass
         total = len(rows)
@@ -829,9 +837,9 @@ class Indexer:
         q = parse_query(text, live=live)
         return self.run(q, limit=limit, offset=offset)
 
-    @_with_db
-    def run(self, q: Query, limit: int = 500, offset: int = 0) -> List[Hit]:
-        c = self._conn()
+    @staticmethod
+    def _filters(q: Query) -> Tuple[List[str], list]:
+        """The folder:/source:/after:/before:/has:att parts of a query as SQL."""
         where: List[str] = []
         args: list = []
         for f in q.folder:
@@ -848,6 +856,12 @@ class Indexer:
             args.append(q.before)
         if q.has_att is not None:
             where.append("m.att_count > 0" if q.has_att else "m.att_count = 0")
+        return where, args
+
+    @_with_db
+    def run(self, q: Query, limit: int = 500, offset: int = 0) -> List[Hit]:
+        c = self._conn()
+        where, args = self._filters(q)
 
         select = ("m.id, m.source_id, s.path AS source_path, s.kind AS source_kind, s.name AS source_name, "
                   "m.folder, m.key, m.subject, m.sender, m.sender_email, m.recipients, m.ts, m.size, "
@@ -901,17 +915,27 @@ class Indexer:
 
     @_with_db
     def count(self, text: str) -> int:
+        """How many messages search() would find with no limit (same filters)."""
         q = parse_query(text)
         c = self._conn()
+        where, args = self._filters(q)
+        sql = "SELECT COUNT(*) FROM messages m JOIN sources s ON s.id = m.source_id"
+        params: list = []
         if q.positive:
             match = " AND ".join(q.positive)
             if q.negative:
                 match = f"({match}) NOT ({' OR '.join(q.negative)})"
-            try:
-                return c.execute("SELECT COUNT(*) FROM docs WHERE docs MATCH ?", (match,)).fetchone()[0]
-            except sqlite3.OperationalError:
-                return 0
-        return c.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+            where.insert(0, "m.id IN (SELECT rowid FROM docs WHERE docs MATCH ?)")
+            params.append(match)
+        elif q.negative:
+            where.insert(0, "m.id NOT IN (SELECT rowid FROM docs WHERE docs MATCH ?)")
+            params.append(" OR ".join(q.negative))
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        try:
+            return c.execute(sql, params + args).fetchone()[0]
+        except sqlite3.OperationalError:
+            return 0
 
     # -- getting back to the real message ---------------------------------
     @_with_db
@@ -968,8 +992,8 @@ class Resolver:
             seen: Dict[str, int] = {}
             rows = list(src.all_message_rows())
             try:
-                if hasattr(src, "orphan_messages"):
-                    rows.extend(src.orphan_messages())
+                if hasattr(src, "orphan_rows"):
+                    rows.extend(src.orphan_rows())
             except Exception:  # noqa: BLE001
                 pass
             for row in rows:

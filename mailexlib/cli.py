@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from typing import List, Tuple
 
@@ -360,6 +361,33 @@ def cmd_index(argv: List[str]) -> int:
         ix.close()
 
 
+_FIND_VALUE_OPTS = ("--db", "-n", "--limit", "--export", "-f", "--format")
+_FIND_FLAG_OPTS = ("--json", "-h", "--help")
+
+
+def _split_find_args(argv: List[str]) -> List[str]:
+    """Options first, then '--' and the query, so an excluded word such as
+    '-newsletter' stays a search term instead of being read as '-n ewsletter'."""
+    opts: List[str] = []
+    terms: List[str] = []
+    i = 0
+    while i < len(argv):
+        t = argv[i]
+        if t == "--":
+            terms.extend(argv[i + 1:])
+            break
+        if t in _FIND_FLAG_OPTS or ("=" in t and t.split("=", 1)[0] in _FIND_VALUE_OPTS) \
+                or re.fullmatch(r"-n\d+|-f(?:eml|mbox|pdf|html|txt|attachments|vcf)", t):
+            opts.append(t)
+        elif t in _FIND_VALUE_OPTS:
+            opts.extend(argv[i:i + 2])
+            i += 1
+        else:
+            terms.append(t)
+        i += 1
+    return opts + ["--"] + terms
+
+
 def cmd_find(argv: List[str]) -> int:
     ap = argparse.ArgumentParser(prog="mailex find", add_help=True)
     ap.add_argument("query", nargs="+")
@@ -368,7 +396,7 @@ def cmd_find(argv: List[str]) -> int:
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--export", default="")
     ap.add_argument("-f", "--format", default="eml", choices=["eml", "mbox", "pdf", "html", "txt", "attachments", "vcf"])
-    a = ap.parse_args(argv)
+    a = ap.parse_args(_split_find_args(argv))
     query = " ".join(a.query)
     ix = _indexer(a.db)
     try:

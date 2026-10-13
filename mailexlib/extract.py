@@ -22,6 +22,7 @@ from . import rtf
 
 MAX_TEXT = 400_000          # characters kept per attachment
 MAX_BYTES = 60 * 1024 * 1024  # bigger attachments are recorded by name only
+MAX_PART = 16 * 1024 * 1024   # bytes read from one zip member or PDF stream (zip-bomb guard)
 
 TEXT_EXT = {".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".xml", ".log", ".ini", ".cfg", ".conf", ".yaml",
             ".yml", ".py", ".js", ".ts", ".css", ".sql", ".sh", ".bat", ".ps1", ".cmd", ".ics", ".vcf", ".vcard",
@@ -68,11 +69,17 @@ def _xml_text(xml: bytes, run_tags=("w:t", "a:t", "t", "text:p", "text:span", "t
     return _html.unescape(s)
 
 
+def _zread(z: zipfile.ZipFile, name: str) -> bytes:
+    """A zip member, cut off at MAX_PART however far it claims to expand."""
+    with z.open(name) as fh:
+        return fh.read(MAX_PART)
+
+
 def _ooxml(z: zipfile.ZipFile, names) -> str:
     parts = []
     for n in names:
         try:
-            parts.append(_xml_text(z.read(n)))
+            parts.append(_xml_text(_zread(z, n)))
         except (KeyError, zipfile.BadZipFile, zlib.error):
             continue
         if sum(len(p) for p in parts) > MAX_TEXT:
@@ -100,14 +107,14 @@ def extract_xlsx(data: bytes) -> str:
     with zipfile.ZipFile(io.BytesIO(data)) as z:
         out = []
         try:
-            shared = _decode(z.read("xl/sharedStrings.xml"))
+            shared = _decode(_zread(z, "xl/sharedStrings.xml"))
             strings = [_html.unescape(_TAG.sub("", m)) for m in re.findall(r"<si>(.*?)</si>", shared, re.S)]
         except KeyError:
             strings = []
         out.extend(strings)
         for n in sorted(x for x in z.namelist() if re.match(r"xl/worksheets/sheet\d+\.xml$", x)):
             try:
-                xml = _decode(z.read(n))
+                xml = _decode(_zread(z, n))
             except (KeyError, zlib.error):
                 continue
             # inline strings and numbers (shared strings are already in)
@@ -171,13 +178,11 @@ _PDF_STRING = re.compile(rb"\((?:\\.|[^\\)])*\)|<[0-9A-Fa-f\s]+>")
 
 
 def _inflate(chunk: bytes) -> bytes:
+    # a decompressobj copes with truncated streams and stops at MAX_PART
     try:
-        return zlib.decompress(chunk)
+        return zlib.decompressobj().decompress(chunk, MAX_PART)
     except zlib.error:
-        try:
-            return zlib.decompressobj().decompress(chunk)
-        except zlib.error:
-            return chunk
+        return chunk
 
 
 def _pdf_decode_stream(dictionary: bytes, chunk: bytes) -> bytes:

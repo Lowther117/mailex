@@ -58,6 +58,21 @@ class MailSource:
         self.warnings: List[str] = []
         self.root: "GenericFolder" = GenericFolder(self, 1, os.path.splitext(self.name)[0] or self.name)
         self._next_id = 2
+        self._dirs_seen: set = set()
+        if os.path.isdir(path):
+            self._new_dir(path)
+
+    def _new_dir(self, d: str) -> bool:
+        """False for a directory this source has already walked: a symlink (or
+        junction) loop, or a second link to the same place, is not followed."""
+        try:
+            key = os.path.normcase(os.path.realpath(d))
+        except (OSError, ValueError):
+            return True
+        if key in self._dirs_seen:
+            return False
+        self._dirs_seen.add(key)
+        return True
 
     @property
     def description(self) -> str:
@@ -242,6 +257,26 @@ def _hdr(value) -> str:
     return re.sub(r"[\r\n]+", " ", s).replace("\x00", "").strip()
 
 
+def _raw8(raw: str) -> Optional[str]:
+    """A header the parser kept as raw 8-bit (surrogate-escaped bytes, no MIME
+    encoding) read as UTF-8, else Windows-1252; None if it holds no raw bytes."""
+    if not any("\udc80" <= c <= "\udcff" for c in raw):
+        return None
+    b = raw.encode("utf-8", "surrogateescape")
+    for cs in ("utf-8", "cp1252"):
+        try:
+            text = b.decode(cs)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        text = b.decode("latin-1")
+    try:
+        return str(make_header(decode_header(text)))   # any =?..?= words as well
+    except Exception:  # noqa: BLE001
+        return text
+
+
 def _parse_date(value: str, fallback: Optional[_dt.datetime] = None) -> Optional[_dt.datetime]:
     if value:
         try:
@@ -384,9 +419,21 @@ class MimeMessage:
     # -- headers ------------------------------------------------------------
     def header(self, name: str) -> str:
         try:
-            return _hdr(self.em.get(name))
+            s = _hdr(self.em.get(name))
         except Exception:  # noqa: BLE001
             return ""
+        if "\ufffd" in s or any("\udc80" <= c <= "\udcff" for c in s):
+            # raw 8-bit header: decode the original bytes instead of showing U+FFFD
+            try:
+                for k, raw in self.em.raw_items():
+                    if k.lower() == name.lower():
+                        fixed = _raw8(raw) if isinstance(raw, str) else None
+                        if fixed is not None:
+                            return _hdr(fixed)
+                        break
+            except Exception:  # noqa: BLE001
+                pass
+        return s
 
     @property
     def subject(self) -> str:
@@ -676,6 +723,11 @@ def _part_text(part) -> str:
         if hasattr(part, "get_content"):
             v = part.get_content()
             if isinstance(v, str):
+                if "\ufffd" in v and (part.get_content_charset() or "us-ascii") == "us-ascii":
+                    # 8-bit text with no (or an ASCII) charset: try UTF-8, then cp1252
+                    alt = _payload_text(part)
+                    if alt and "\ufffd" not in alt:
+                        return alt
                 return v
     except Exception:  # noqa: BLE001 - odd charset, broken transfer encoding...
         pass
@@ -783,11 +835,23 @@ class _MboxFolder:
             with open(self.path, "rb") as fh:
                 pos = 0
                 prev_blank = True
-                for line in fh:
-                    if line.startswith(b"From ") and prev_blank:
-                        starts.append((pos, pos + len(line)))
-                    prev_blank = line in (b"\n", b"\r\n")
+                while True:
+                    line = fh.readline()
+                    if not line:
+                        break
                     pos += len(line)
+                    if line.startswith(b"From ") and prev_blank:
+                        starts.append((pos - len(line), pos))
+                        # mboxcl/mboxcl2: a Content-Length that lands on the next
+                        # envelope (or the end) lets body lines starting "From " stay put
+                        skip = self._content_length_end(fh)
+                        if skip is not None:
+                            pos = skip
+                            fh.seek(pos)
+                            prev_blank = True
+                            continue
+                        fh.seek(pos)
+                    prev_blank = line in (b"\n", b"\r\n")
                 size = pos
             out = []
             for i, (env, body) in enumerate(starts):
@@ -795,6 +859,38 @@ class _MboxFolder:
                 out.append((env, body, end))
             self._index = out
         return self._index
+
+    @staticmethod
+    def _content_length_end(fh) -> Optional[int]:
+        """Just after an envelope line: where the body ends if the headers carry a
+        Content-Length that is believable (it ends on a line, followed only by blank
+        lines and then another "From " line or the end of the file), else None."""
+        clen = None
+        while True:
+            line = fh.readline()
+            if not line:
+                return None
+            if line in (b"\n", b"\r\n"):
+                break
+            if line[:15].lower() == b"content-length:":
+                try:
+                    clen = int(line[15:].strip())
+                except ValueError:
+                    return None
+        if clen is None or clen < 0:
+            return None
+        end = fh.tell() + clen
+        if end > os.fstat(fh.fileno()).st_size:
+            return None
+        if clen:
+            fh.seek(end - 1)
+            if fh.read(1) != b"\n":
+                return None
+        fh.seek(end)
+        nxt = fh.readline()
+        while nxt in (b"\n", b"\r\n"):
+            nxt = fh.readline()
+        return end if (not nxt or nxt.startswith(b"From ")) else None
 
     def _read(self, i: int, head_only: bool = False) -> bytes:
         _env, start, end = self.index()[i]
@@ -929,6 +1025,8 @@ class MailDirSource(MailSource):
             if not os.path.isdir(p):
                 continue
             low = e.lower()
+            if not (low in ("cur", "new", "tmp") or is_maildir(p)) and not self._new_dir(p):
+                continue
             if low.endswith(".sbd"):
                 name = e[:-4]
                 parent = made.get(name.lower()) or folder.add_subfolder(name)
@@ -980,7 +1078,7 @@ class MaildirSource(MailSource):
             return
         for e in entries:
             p = os.path.join(d, e)
-            if not os.path.isdir(p) or e in ("cur", "new", "tmp"):
+            if not os.path.isdir(p) or e in ("cur", "new", "tmp") or not self._new_dir(p):
                 continue
             name = e[1:] if e.startswith(".") else e
             # Courier style ".Inbox.Sub" -> nested names
@@ -1003,7 +1101,7 @@ class MaildirSource(MailSource):
             return
         for e in entries:
             p = os.path.join(d, e)
-            if not os.path.isdir(p):
+            if not os.path.isdir(p) or not self._new_dir(p):
                 continue
             sf = folder.add_subfolder(e[1:] if e.startswith(".") else e)
             if is_maildir(p):
@@ -1110,7 +1208,7 @@ def attach_apple_package(source: MailSource, folder: GenericFolder, package: str
         entries = []
     for e in entries:
         p = os.path.join(package, e)
-        if os.path.isdir(p) and e.lower().endswith(".mbox"):
+        if os.path.isdir(p) and e.lower().endswith(".mbox") and source._new_dir(p):
             attach_apple_package(source, folder.add_subfolder(e[:-5]), p)
 
 
@@ -1198,7 +1296,8 @@ class FilesSource(MailSource):
             folder._loader = lambda files=files, folder=folder: (file_row(self, folder, p) for p in files)
         for e in entries:
             p = os.path.join(d, e)
-            if not os.path.isdir(p) or e.lower().endswith((".sbd", ".mbox")) or is_maildir(p) or e in ("cur", "new", "tmp"):
+            if not os.path.isdir(p) or e.lower().endswith((".sbd", ".mbox")) or is_maildir(p) or e in ("cur", "new", "tmp") \
+                    or not self._new_dir(p):
                 continue
             sf = folder.add_subfolder(e)
             before = self.count

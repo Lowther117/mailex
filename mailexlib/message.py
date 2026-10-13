@@ -808,3 +808,22 @@ class PSTFile:
                 if nid_type(n) == NID_TYPE_NORMAL_MESSAGE and n not in listed and parent not in reachable:
                     out.append(n)
         return sorted(out)
+
+    def orphan_rows(self) -> List[MessageRow]:
+        """The orphan messages as rows of a '(orphaned messages)' pseudo-folder, so they
+        can be listed, indexed and exported like any other. Unreadable ones are skipped."""
+        folder = Folder(self, 0, "(orphaned messages)", self.root)
+        rows: List[MessageRow] = []
+        for nid in self.orphan_messages():
+            try:
+                m = self.message(nid, folder=folder)
+                rows.append(MessageRow(folder, {mapi.PR_LTP_ROW_ID: nid, mapi.PR_SUBJECT: m.subject,
+                                                mapi.PR_SENDER_NAME: m.sender, mapi.PR_MESSAGE_DELIVERY_TIME: m.date,
+                                                mapi.PR_MESSAGE_SIZE: m.size, mapi.PR_HASATTACH: m.has_attachments,
+                                                mapi.PR_MESSAGE_CLASS: m.message_class, mapi.PR_DISPLAY_TO: m.display_to}))
+            except Exception:  # noqa: BLE001
+                continue
+        folder._rows = rows
+        folder._subfolders = []
+        folder.content_count = len(rows)
+        return rows

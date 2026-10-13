@@ -40,8 +40,11 @@ FORMATS = {
     "vcf": "Contacts (vCard + CSV) - one .vcf per contact, plus contacts.vcf and contacts.csv for importing",
 }
 
-_WIN_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
+_WIN_RESERVED = {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"} | \
+    {f"{d}{i}" for d in ("COM", "LPT") for i in list("0123456789") + ["\u00b9", "\u00b2", "\u00b3"]}
 _BAD_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
+# invisible direction marks/overrides: dropped, they can make "exe.pdf" display as "fdp.exe"
+_BIDI_CHARS = re.compile("[\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 
 
 def sanitize(name: str, maxlen: int = 120, maxbytes: int = 200) -> str:
@@ -51,7 +54,7 @@ def sanitize(name: str, maxlen: int = 120, maxbytes: int = 200) -> str:
     bytes per name, so a CJK or emoji subject must be cut shorter than a Latin
     one); the extension, if there is one, is kept.
     """
-    name = (name or "").replace("\x00", "")
+    name = _BIDI_CHARS.sub("", (name or "").replace("\x00", ""))
     name = _BAD_CHARS.sub("_", name)
     name = re.sub(r"\s+", " ", name).strip(" .")
     stem, ext = os.path.splitext(name)
@@ -135,9 +138,21 @@ def _fmt(name: str, addr: str) -> str:
         return f'"{n}" <{addr}>' if n else addr
 
 
+def _one_line(v) -> str:
+    """Join every kind of line break Python knows (\v, \f, U+2028, NEL...) into
+    spaces - the email package refuses header values that contain any of them."""
+    return " ".join(str(v).splitlines())
+
+
+def _ascii_ids(v: str) -> str:
+    """Message-ID / In-Reply-To / References must be ASCII to be written at all;
+    percent-encode anything else (consistently, so threading still matches)."""
+    return quote(v, safe="".join(chr(i) for i in range(0x20, 0x7F)))
+
+
 def _addr(name: str, addr: str) -> str:
-    name = (name or "").strip().replace("\r", " ").replace("\n", " ")
-    addr = (addr or "").strip()
+    name = _one_line((name or "").strip()).strip()
+    addr = _one_line((addr or "").strip()).strip()
     if addr and "@" in addr:
         if name and name.lower() != addr.lower():
             return _fmt(name, addr)
@@ -189,6 +204,7 @@ def build_eml(msg: Message, include_attachments: bool = True, depth: int = 0) ->
 
     def put(k, v):
         if v:
+            v = _one_line(v)
             try:
                 em[k] = v
             except Exception:  # noqa: BLE001
@@ -206,9 +222,9 @@ def build_eml(msg: Message, include_attachments: bool = True, depth: int = 0) ->
     if mid:
         if not mid.startswith("<"):
             mid = f"<{mid}>"
-        put("Message-ID", mid)
-    put("In-Reply-To", msg.in_reply_to)
-    put("References", msg.references)
+        put("Message-ID", _ascii_ids(mid))
+    put("In-Reply-To", _ascii_ids(msg.in_reply_to))
+    put("References", _ascii_ids(msg.references))
     put("X-Mailex-Message-Class", msg.message_class)
     if msg.folder is not None and depth == 0:
         put("X-Mailex-Folder", msg.folder.path_str)
@@ -442,7 +458,7 @@ class Exporter:
         self.cancel = cancel or threading.Event()
         self.result = ExportResult(out_dir=options.out_dir)
         self._taken: set = set()
-        self._mboxes: Dict[str, mailbox.mbox] = {}
+        self._mboxes: Dict[tuple, Tuple[mailbox.mbox, str]] = {}
         self._pdf = None
         self._cards: List[str] = []              # every vCard written, for the combined contacts.vcf
         self._contact_rows: List[dict] = []      # and the rows of contacts.csv
@@ -493,7 +509,7 @@ class Exporter:
         return self.result
 
     def _finish(self):
-        for mb in self._mboxes.values():
+        for mb, _path in self._mboxes.values():
             try:
                 mb.flush()
                 mb.close()
@@ -626,12 +642,16 @@ class Exporter:
                 path = os.path.join(parent, name + ".mbox")
             else:
                 path = os.path.join(out_dir, "mailbox.mbox")
-            mb = self._mboxes.get(path)
-            if mb is None:
+            # one new .mbox per source folder per run: never append to a file an
+            # earlier export left there, never merge two folders that sanitise alike
+            key = (id(row.folder) if self.o.mirror_folders else None, path)
+            got = self._mboxes.get(key)
+            if got is None:
                 os.makedirs(fs_path(os.path.dirname(path)), exist_ok=True)
-                mb = mailbox.mbox(fs_path(path), create=True)
-                self._mboxes[path] = mb
+                path = unique_path(path, self._taken)
+                got = self._mboxes[key] = (mailbox.mbox(fs_path(path), create=True), path)
                 self.result.files_written += 1
+            mb, path = got
             # mailbox rewrites "\n" as os.linesep, so hand it LF-only bytes or
             # Windows gets "\r\r\n" on every line
             raw = msg.raw_eml() if (self.o.include_attachments and hasattr(msg, "raw_eml")) else None
@@ -674,7 +694,7 @@ class Exporter:
                     else os.path.join(out_dir, base + " - attachments")
                 self._save_attachments(msg, folder)
         elif fmt == "attachments":
-            folder = os.path.join(out_dir, base) if self.o.attachments_subfolder else out_dir
+            folder = unique_path(os.path.join(out_dir, base), self._taken) if self.o.attachments_subfolder else out_dir
             saved = self._save_attachments(msg, folder)
             path = folder if saved else ""
         else:
