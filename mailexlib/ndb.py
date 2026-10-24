@@ -164,9 +164,14 @@ class NDB:
         self._lock = threading.RLock()
         self.size = os.path.getsize(path)
         self._page_cache = _LRU(4096)
+        self._branch_cache = _LRU(4096)
         self._block_cache = _LRU(512)
         self._sub_cache = _LRU(512)
-        self._read_header()
+        try:
+            self._read_header()
+        except Exception:
+            self._fh.close()
+            raise
 
     # -- lifecycle --------------------------------------------------------
     def close(self):
@@ -304,7 +309,10 @@ class NDB:
                 raise PSTError("B-tree page type mismatch")
             if clevel == 0:
                 return cent, cbent, entries
-            branches = self._branch_entries(entries, cent, cbent)
+            branches = self._branch_cache.get(ib)
+            if branches is None:
+                branches = self._branch_entries(entries, cent, cbent)
+                self._branch_cache.put(ib, branches)
             if not branches:
                 return 0, cbent, entries
             # last entry whose key <= search key
@@ -443,9 +451,14 @@ class NDB:
         entry = self.lookup_bbt(bid)
         if entry is None:
             raise PSTError(f"data block 0x{bid:x} missing from the block B-tree")
-        data = self._read_block_entry(entry) if entry.internal else self.read_block(bid)
         if not entry.internal:
+            key = bid & ~1
+            data = self._block_cache.get(key)
+            if data is None:
+                data = self._read_block_entry(entry)
+                self._block_cache.put(key, data)
             return [data]
+        data = self._read_block_entry(entry)
         if len(data) < 8 or data[0] != 1:
             # Internal flag set but not an array block: treat it as plain data.
             return [data]

@@ -121,10 +121,17 @@ class CompoundFile:
         try:
             mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
         except (ValueError, OSError):
-            data = fh.read()
-            fh.close()
+            try:
+                data = fh.read()
+            finally:
+                fh.close()
             return cls(data)
-        cf = cls(mm)
+        try:
+            cf = cls(mm)
+        except Exception:
+            mm.close()
+            fh.close()
+            raise
         cf._fh = fh
         return cf
 

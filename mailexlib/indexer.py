@@ -689,6 +689,7 @@ class Indexer:
         if progress:
             progress(0, 0, f"Listing {label}…")
         rows = []
+        listing_failed = False
         try:
             for r in source.all_message_rows():
                 rows.append(r)
@@ -696,6 +697,7 @@ class Indexer:
                     break
         except Exception as exc:  # noqa: BLE001
             res.notes.append(f"listing stopped: {exc}")
+            listing_failed = True
         # orphans (PST messages whose folder is gone) are still searchable
         try:
             if hasattr(source, "orphan_rows"):
@@ -750,7 +752,7 @@ class Indexer:
                 pending = 0
 
         with self._write_lock:
-            if not res.cancelled and existing:
+            if not res.cancelled and not listing_failed and existing:
                 ids = list(existing.values())
                 for j in range(0, len(ids), 500):
                     chunk = ids[j:j + 500]
@@ -760,7 +762,7 @@ class Indexer:
                 res.removed = len(ids)
             n_msgs = c.execute("SELECT COUNT(*) FROM messages WHERE source_id=?", (source_id,)).fetchone()[0]
             c.execute("UPDATE sources SET size=?, mtime=?, indexed_at=?, complete=?, messages=? WHERE id=?",
-                      (size, mtime, time.time(), 0 if res.cancelled else 1, n_msgs, source_id))
+                      (size, mtime, time.time(), 0 if (res.cancelled or listing_failed) else 1, n_msgs, source_id))
             c.commit()
         res.seconds = time.time() - t0
         return res

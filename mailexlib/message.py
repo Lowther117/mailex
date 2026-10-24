@@ -693,6 +693,13 @@ class PSTFile:
     def __init__(self, path: str):
         self.path = path
         self.ndb = NDB(path)
+        try:
+            self._open_store(path)
+        except Exception:
+            self.ndb.close()
+            raise
+
+    def _open_store(self, path: str):
         self.cpid: Optional[int] = None
         self.name = os.path.basename(path)
         self.store_name = ""
