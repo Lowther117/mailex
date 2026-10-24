@@ -742,7 +742,12 @@ def _payload_text(part) -> str:
     if raw is None:
         p = part.get_payload()
         return p if isinstance(p, str) else ""
-    cs = (part.get_content_charset() or "utf-8").strip("\"' =3D")
+    # strip quoting and a quoted-printable '=3D' that leaked into the parameter -
+    # but only as a prefix: stripping '3' from the ends turned windows-1253 into
+    # windows-125 and iso-8859-13 into iso-8859-1
+    cs = (part.get_content_charset() or "utf-8").strip("\"' =")
+    if cs.lower().startswith("3d"):
+        cs = cs[2:].strip("\"' =")
     cs = {"iso-8859-8-i": "iso-8859-8", "x-user-defined": "latin-1", "unknown-8bit": "latin-1"}.get(cs.lower(), cs)
     for c in (cs, "utf-8", "cp1252"):
         try:
@@ -909,20 +914,28 @@ class _MboxFolder:
         return data
 
     def rows(self) -> Iterator[GenericRow]:
-        for i in range(len(self.index())):
-            nid = self.source.new_id()
-            try:
-                head = self._read(i, head_only=True)
-            except OSError:
-                continue
-            _env, start, end = self.index()[i]
+        index = self.index()
+        # one handle for the whole listing pass (not an open per message), and
+        # only as much of each message as its header block needs
+        try:
+            fh = open(self.path, "rb")
+        except OSError:
+            return
+        with fh:
+            for i, (_env, start, end) in enumerate(index):
+                nid = self.source.new_id()
+                try:
+                    fh.seek(start)
+                    head = _read_head(fh, min(end - start, 65536))
+                except OSError:
+                    continue
 
-            def opener(row, i=i):
-                return MimeMessage(self.source, self._read(i), folder=self.folder, row=row)
+                def opener(row, i=i):
+                    return MimeMessage(self.source, self._read(i), folder=self.folder, row=row)
 
-            row = row_from_bytes(self.folder, nid, head, opener)
-            row.size = end - start
-            yield row
+                row = row_from_bytes(self.folder, nid, head, opener)
+                row.size = end - start
+                yield row
 
     def close(self):
         pass
@@ -1262,9 +1275,20 @@ def file_row(source: MailSource, folder: GenericFolder, p: str) -> GenericRow:
     return row
 
 
+def _read_head(fh, limit: int) -> bytes:
+    """Up to `limit` bytes from fh, stopping after a first 16 KB when the header
+    block already ends inside it - the listing only parses the headers, so the
+    result for row_from_bytes is the same as reading all `limit` bytes."""
+    first = min(limit, 16384)
+    data = fh.read(first)
+    if len(data) == first < limit and b"\n\n" not in data and b"\r\n\r\n" not in data:
+        data += fh.read(limit - first)
+    return data
+
+
 def _head_bytes(p: str, limit: int = 262144) -> bytes:
     with open(p, "rb") as fh:
-        return fh.read(limit)
+        return _read_head(fh, limit)
 
 
 class FilesSource(MailSource):

@@ -20,9 +20,10 @@ pick() {
 if [ ! -x "$VENV/bin/python" ]; then
   echo "First run - setting Python up. This happens once."
   PY="$(pick)" || { echo "No Python with a usable Tk found. Run build-app.command once; it installs one."; read -r; exit 1; }
-  "$PY" -m venv "$VENV" || { echo "Could not create the environment."; read -r; exit 1; }
+  # a failed setup removes the half-built .venv, or the next run would trust it
+  "$PY" -m venv "$VENV" || { echo "Could not create the environment."; rm -rf "$VENV"; read -r; exit 1; }
   "$VENV/bin/python" -m pip install --upgrade pip >/dev/null
-  "$VENV/bin/python" -m pip install --only-binary :all: -r requirements.txt || { read -r; exit 1; }
+  "$VENV/bin/python" -m pip install --only-binary :all: -r requirements.txt || { rm -rf "$VENV"; read -r; exit 1; }
   # optional, better PDF text for the index; fine if there is no wheel
   "$VENV/bin/python" -m pip install --only-binary :all: -r requirements-optional.txt >/dev/null 2>&1 || true
 fi

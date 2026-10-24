@@ -45,6 +45,10 @@ _WIN_RESERVED = {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"} | \
 _BAD_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
 # invisible direction marks/overrides: dropped, they can make "exe.pdf" display as "fdp.exe"
 _BIDI_CHARS = re.compile("[\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+# MBOX export keeps a file open per source folder; past this many the least
+# recently used is closed (and reopened for appending if its folder comes back),
+# so a mailbox with hundreds of folders stays under macOS's 256 open files
+_MAX_OPEN_MBOXES = 64
 
 
 def sanitize(name: str, maxlen: int = 120, maxbytes: int = 200) -> str:
@@ -67,7 +71,8 @@ def sanitize(name: str, maxlen: int = 120, maxbytes: int = 200) -> str:
     name = (stem.rstrip(" .") + ext) if stem.strip(" .") else ext.lstrip(".")
     if not name:
         name = "untitled"
-    if name.split(".")[0].upper() in _WIN_RESERVED:
+    # Windows ignores trailing spaces here too: "aux .tar.gz" is the AUX device
+    if name.split(".")[0].rstrip(" ").upper() in _WIN_RESERVED:
         name = "_" + name
     return name
 
@@ -458,7 +463,8 @@ class Exporter:
         self.cancel = cancel or threading.Event()
         self.result = ExportResult(out_dir=options.out_dir)
         self._taken: set = set()
-        self._mboxes: Dict[tuple, Tuple[mailbox.mbox, str]] = {}
+        self._mboxes: Dict[tuple, Tuple[Optional[mailbox.mbox], str]] = {}
+        self._mbox_open: Dict[tuple, None] = {}     # keys whose mbox is open, least recently used first
         self._pdf = None
         self._cards: List[str] = []              # every vCard written, for the combined contacts.vcf
         self._contact_rows: List[dict] = []      # and the rows of contacts.csv
@@ -510,12 +516,15 @@ class Exporter:
 
     def _finish(self):
         for mb, _path in self._mboxes.values():
+            if mb is None:
+                continue
             try:
                 mb.flush()
                 mb.close()
             except Exception:  # noqa: BLE001
                 pass
         self._mboxes.clear()
+        self._mbox_open.clear()
         if self._pdf is not None:
             try:
                 self._pdf.finish()
@@ -651,6 +660,17 @@ class Exporter:
                 path = unique_path(path, self._taken)
                 got = self._mboxes[key] = (mailbox.mbox(fs_path(path), create=True), path)
                 self.result.files_written += 1
+            elif got[0] is None:
+                # closed to stay under the open-file limit: carry on appending to our own file
+                got = self._mboxes[key] = (mailbox.mbox(fs_path(got[1]), create=False), got[1])
+            self._mbox_open.pop(key, None)
+            self._mbox_open[key] = None
+            while len(self._mbox_open) > _MAX_OPEN_MBOXES:
+                old = next(iter(self._mbox_open))
+                del self._mbox_open[old]
+                old_mb, old_path = self._mboxes[old]
+                self._mboxes[old] = (None, old_path)
+                old_mb.close()
             mb, path = got
             # mailbox rewrites "\n" as os.linesep, so hand it LF-only bytes or
             # Windows gets "\r\r\n" on every line

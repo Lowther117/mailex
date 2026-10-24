@@ -13,16 +13,23 @@ for /f "usebackq delims=" %%P in (`powershell -NoProfile -ExecutionPolicy Bypass
 if not defined PY goto :nopython
 if not exist "%PY%" goto :nopython
 "%PY%" -m venv "%VENV%"
-if errorlevel 1 ( echo Could not create the environment. & pause & exit /b 1 )
+if errorlevel 1 ( echo Could not create the environment. & goto :setupfail )
 "%VENV%\Scripts\python.exe" -m pip install --upgrade pip >nul
 "%VENV%\Scripts\python.exe" -m pip install --only-binary :all: -r "%~dp0requirements.txt"
-if errorlevel 1 ( pause & exit /b 1 )
+if errorlevel 1 goto :setupfail
 REM  optional, better PDF text for the index; fine if there is no wheel
 "%VENV%\Scripts\python.exe" -m pip install --only-binary :all: -r "%~dp0requirements-optional.txt" >nul 2>&1
 
 :run
 start "" "%VENV%\Scripts\pythonw.exe" "%~dp0mailex.py" %*
 exit /b 0
+
+:setupfail
+REM  a half-built .venv would be trusted by the next run; remove it so that
+REM  run sets Python up again from the start
+if exist "%VENV%" rmdir /s /q "%VENV%"
+pause
+exit /b 1
 
 :nopython
 echo Could not find or install Python.

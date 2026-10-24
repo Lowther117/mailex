@@ -242,6 +242,10 @@ class TableContext:
         if self.hid_row_index == 0:
             return []
         cbkey, cbent, entries = bth_entries(self.hn, self.hid_row_index)
+        if entries and cbent < 2:
+            # a 1-byte row index would make the unpack below raise struct.error,
+            # which callers (they catch PSTError) would not recover from
+            raise PSTError("table row index has impossible sizes")
         out = []
         for key, data in entries:
             rid = struct.unpack_from("<I", key)[0] if cbkey == 4 else int.from_bytes(key, "little")

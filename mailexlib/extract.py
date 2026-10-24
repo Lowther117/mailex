@@ -306,18 +306,18 @@ def _pdf_builtin(data: bytes) -> str:
 # ---------------------------------------------------------------------------
 # saved messages, archives
 # ---------------------------------------------------------------------------
-def extract_eml(data: bytes) -> str:
+def extract_eml(data: bytes, depth: int = 0) -> str:
     from .sources import MimeMessage
     m = MimeMessage(None, data)
     head = "\n".join(f"{k}: {v}" for k, v in (("Subject", m.subject), ("From", m.sender), ("To", m.display_to)) if v)
     parts = [head, m.best_text()]
     for a in m.attachments():
         parts.append(a.filename)
-        parts.append(extract(a.filename, a.data, a.mime_type, depth=1))
+        parts.append(extract(a.filename, a.data, a.mime_type, depth=depth + 1))
     return "\n".join(p for p in parts if p)
 
 
-def extract_msg(data: bytes) -> str:
+def extract_msg(data: bytes, depth: int = 0) -> str:
     from .cfb import CompoundFile
     from .msgfile import MsgMessage
     m = MsgMessage(None, None, cf=CompoundFile(data))
@@ -331,7 +331,7 @@ def extract_msg(data: bytes) -> str:
                 parts.append(emb.subject)
                 parts.append(emb.best_text())
         else:
-            parts.append(extract(a.filename, a.data, a.mime_type, depth=1))
+            parts.append(extract(a.filename, a.data, a.mime_type, depth=depth + 1))
     return "\n".join(p for p in parts if p)
 
 
@@ -429,9 +429,9 @@ def extract(filename: str, data: Optional[bytes], mime: str = "", depth: int = 0
         if kind == "pdf":
             return _clean(extract_pdf(data))
         if kind == "eml" and depth < 3:
-            return _clean(extract_eml(data))
+            return _clean(extract_eml(data, depth))
         if kind == "msg" and depth < 3:
-            return _clean(extract_msg(data))
+            return _clean(extract_msg(data, depth))
         if kind == "zip" and depth < 2:
             return _clean(extract_zip(data, depth))
         if kind == "ole":

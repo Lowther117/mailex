@@ -175,7 +175,7 @@ def cmd_export(argv: List[str]) -> int:
     from .export import ExportOptions, Exporter
     from .filters import parse_extensions
 
-    out = a.out or os.path.join(default_save_dir(), "Mail export")
+    out = a.out or os.path.join(default_save_dir(), "Mailex export")
     psts, rows = _collect_rows(a.sources, a.folder)
     if not psts:
         print("nothing to export", file=sys.stderr)
