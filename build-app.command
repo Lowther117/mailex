@@ -101,7 +101,10 @@ echo "[3/7] Installing dependencies (wheels only, no compiling)..."
 "$VPY" -m pip install --only-binary :all: pyinstaller || die "PyInstaller would not install."
 # Optional: PyMuPDF reads complex PDFs better for the content index. No wheel for
 # this Python is not an error - the built-in PDF reader takes over.
+# PyMuPDF 2.0 installs pymupdf-layout INSIDE the pymupdf package folder, so a
+# plain downgrade leaves it there for --collect-all to sweep up. Clear it first.
 PDF_EXTRA=""
+"$VPY" -m pip uninstall -y pymupdf pymupdf-layout pymupdf4llm onnxruntime networkx >/dev/null 2>&1 || true
 if "$VPY" -m pip install --only-binary :all: -r "$HERE/requirements-optional.txt" >/dev/null 2>&1 \
    && "$VPY" -c "import pymupdf" >/dev/null 2>&1; then
   echo "      PyMuPDF installed (better PDF text for the index)."

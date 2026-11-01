@@ -1,3 +1,5 @@
 # Optional. Better text extraction from complex PDFs for the content index.
 # The build and run scripts try it and carry on without it when there is no wheel.
-pymupdf>=1.24
+# <2: PyMuPDF 2.0 drags in pymupdf-layout / pymupdf4llm / onnxruntime (hundreds of
+# MB of AI layout models Mailex never uses) and crashes PyInstaller's dependency scan.
+pymupdf>=1.24,<2

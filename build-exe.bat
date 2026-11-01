@@ -38,7 +38,11 @@ if errorlevel 1 goto :fail
 if errorlevel 1 goto :fail
 REM  Optional: PyMuPDF reads complex PDFs better for the content index. No wheel
 REM  for this Python is not an error - the built-in PDF reader takes over.
+REM  PyMuPDF 2.0 installs pymupdf-layout INSIDE the pymupdf package folder, so a
+REM  plain downgrade leaves it there for --collect-all to sweep up - and loaded
+REM  with its onnxruntime the build dies with an access violation. Clear it first.
 set "PDF_EXTRA="
+"%VPY%" -m pip uninstall -y pymupdf pymupdf-layout pymupdf4llm onnxruntime networkx >> "%LOG%" 2>&1
 "%VPY%" -m pip install --only-binary :all: -r "%~dp0requirements-optional.txt" >> "%LOG%" 2>&1
 "%VPY%" -c "import pymupdf" >> "%LOG%" 2>&1
 if errorlevel 1 (
