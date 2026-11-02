@@ -98,7 +98,7 @@ VPY="$VENV/bin/python"
 echo "[3/7] Installing dependencies (wheels only, no compiling)..."
 "$VPY" -m pip install --upgrade pip wheel >/dev/null || die "pip would not upgrade."
 "$VPY" -m pip install --only-binary :all: -r "$HERE/requirements.txt" || die "A dependency has no wheel for this Mac."
-"$VPY" -m pip install --only-binary :all: pyinstaller || die "PyInstaller would not install."
+"$VPY" -m pip install --only-binary :all: "pyinstaller>=6.11,<7" || die "PyInstaller would not install."
 # Optional: PyMuPDF reads complex PDFs better for the content index. No wheel for
 # this Python is not an error - the built-in PDF reader takes over.
 # PyMuPDF 2.0 installs pymupdf-layout INSIDE the pymupdf package folder, so a

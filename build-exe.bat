@@ -34,7 +34,7 @@ echo [3/6] Installing dependencies (wheels only, no compiling)...
 "%VPY%" -m pip install --upgrade pip wheel >> "%LOG%" 2>&1
 "%VPY%" -m pip install --only-binary :all: -r "%~dp0requirements.txt" >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
-"%VPY%" -m pip install --only-binary :all: pyinstaller >> "%LOG%" 2>&1
+"%VPY%" -m pip install --only-binary :all: "pyinstaller>=6.11,<7" >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 REM  Optional: PyMuPDF reads complex PDFs better for the content index. No wheel
 REM  for this Python is not an error - the built-in PDF reader takes over.

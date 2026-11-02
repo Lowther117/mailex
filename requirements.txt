@@ -1,3 +1,7 @@
-reportlab>=4.0
-pillow>=10.0
-tkinterdnd2>=0.3.0
+# Every package here has a floor (the oldest version these scripts were
+# tested with) and a ceiling at the next major version. A new major is
+# something to opt into after a test build, never something a routine
+# rebuild discovers for you - PyMuPDF 2.0 broke two builds that way (Nov 2026).
+reportlab>=4.0,<5
+pillow>=10.0,<14
+tkinterdnd2>=0.3.0,<1
