@@ -960,7 +960,8 @@ def _check_sources(record, tmp: str, mailbox_def):
     want = {"docx": "Renewal terms for Acme\nPenalty clause zebra", "xlsx": "Widget\nFlamingo budget\n4242", "pptx": "Roadmap\nQ4 goals",
             "odt": "Alpha beta\nGamma", "pdf": "Quarterly PDF report mentions giraffe Second page (brackets) & more",
             "zip": "notes.txt\nsecret phrase inside zip\nimg.png", "html": "Para one"}
-    bad = [k for k, v in want.items() if got[k] != v]
+    norm = lambda s_: " ".join(s_.split())   # PDF engines differ only in whitespace between pages
+    bad = [k for k, v in want.items() if (norm(got[k]) if k == "pdf" else got[k]) != (norm(v) if k == "pdf" else v)]
     bad += [k for k in ("rtf", "eml", "msg") if not got[k]] + (["junk"] if got["junk"] else [])
     bad += [] if "Hello from RTF" in got["rtf"] and "inner body text" in got["eml"] and "inner subject" in got["eml"] else ["rtf/eml content"]
     record("attachment text extraction (docx/xlsx/pptx/odf/pdf/zip/rtf/html/eml/msg)", not bad,
