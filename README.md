@@ -11,7 +11,7 @@ contacts, or just the **attachments**. Or drag messages straight out of the
 list into a folder. A **content index** makes every message *and every
 attachment* - Word, Excel, PowerPoint, PDF, ZIP and the rest - searchable in
 milliseconds across all your mailboxes at once. Windows and macOS, one window,
-Phosphor purple theme by default (the same look as Winnow).
+Phosphor glass theme by default (the same look as the website and Winnow).
 
 The PST/OST reader and the compound-file reader behind `.msg` are written from
 scratch in Python from Microsoft's published specifications ([MS-PST],
@@ -173,7 +173,7 @@ else, or set a default under *File > Default save folder*.
   for messages that no folder lists any more - things that were deleted but
   whose data is still in the file - and adds them as a pseudo-folder you can
   export from.
-- Ctrl+D cycles the theme: Phosphor purple (the default, same look as Winnow) → Dark → Light.
+- Ctrl+D cycles the theme: Phosphor glass (the default, same look as the website) → Phosphor purple → Dark → Light.
 
 ### The content index
 
